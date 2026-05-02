@@ -17,7 +17,6 @@ import logging
 import traceback
 import base64
 import random
-import string
 from datetime import datetime
 import ssl
 import queue
@@ -43,7 +42,7 @@ else:
 from PIL import Image, ImageDraw, ImageGrab
 
 # --- CONFIGURATION ---
-AGENT_VERSION = "4.0.2"
+AGENT_VERSION = "4.0.3"
 ADMIN_PASSWORD = "1886wysiwyG"     
 
 # --- ANTI-CLOUDFLARE HEADERS ---
@@ -295,7 +294,6 @@ def gather_telemetry():
     except Exception: pass
         
     mac = ':'.join(['{:02x}'.format((uuid.getnode() >> ele) & 0xff) for ele in range(0,8*6,8)][::-1]).upper()
-    laps_pass = load_config().get("laps_password", "N/A")
 
     return {
         "api_key": AGENT_API_KEY, "asset_tag": ASSET_TAG, "make": AGENT_CACHE.get('make', 'Unknown'), "model": AGENT_CACHE.get('model', 'Unknown'), 
@@ -305,7 +303,7 @@ def gather_telemetry():
         "bitlocker": bitlocker or "UNVERIFIED", "domain_location": AGENT_CACHE.get('domain_location', 'Unknown'), 
         "purchase_date": AGENT_CACHE.get('purchase_date', 'Unknown'), "software_installed": AGENT_CACHE.get('software', 'Unknown'), 
         "agent_version": AGENT_VERSION, "anydesk_id": AGENT_CACHE.get('anydesk', 'Unknown'), "battery": battery, 
-        "disk_warning": disk_warning, "active_minutes": ACTIVE_MINUTES_TODAY, "laps_password": laps_pass
+        "disk_warning": disk_warning, "active_minutes": ACTIVE_MINUTES_TODAY
     }
 
 # ==========================================
@@ -571,7 +569,7 @@ def run_store_ui():
     root.mainloop()
 
 # ==========================================
-# TICKET UI (WITH AUTO-SCREENSHOT & DIAG)
+# TICKET UI (WITH NATIVE SCREENSHOT & DIAG)
 # ==========================================
 def run_ticket_ui():
     logging.info("Building Ticket UI...")
@@ -619,18 +617,26 @@ def run_ticket_ui():
             "category": "Self-Service", "priority": "Normal", "subject": subject_text, "description": desc_text
         }
 
-        # --- TICKET ATTACHMENT INJECTION ---
+        # --- NATIVE SCREENSHOT CAPTURE ---
         try:
-            ss = ImageGrab.grab()
             ss_path = os.path.join(os.environ.get('TEMP', '/tmp'), "ticket_ss.jpg")
-            ss.convert("RGB").save(ss_path, format="JPEG", quality=70) 
-            with open(ss_path, "rb") as f:
-                b64_img = base64.b64encode(f.read()).decode('utf-8')
+            if SYS_OS == "Darwin":
+                # Uses Apple's native tool for perfect Retina support and reliable permissions
+                subprocess.run(["screencapture", "-x", "-t", "jpg", ss_path], check=True)
+            else:
+                ss = ImageGrab.grab()
+                ss.convert("RGB").save(ss_path, format="JPEG", quality=70) 
             
-            # Send the screenshot securely inside the main ticket payload
-            payload["file_name"] = f"SCREENSHOT_{datetime.now().strftime('%H%M%S')}.jpg"
-            payload["file_data"] = b64_img
-            
+            if os.path.exists(ss_path):
+                with open(ss_path, "rb") as f:
+                    b64_img = base64.b64encode(f.read()).decode('utf-8')
+                
+                # Send the screenshot securely inside the main ticket payload
+                payload["file_name"] = f"SCREENSHOT_{datetime.now().strftime('%H%M%S')}.jpg"
+                payload["file_data"] = b64_img
+                
+                try: os.remove(ss_path)
+                except: pass
         except Exception as e: logging.error(f"Auto-Screenshot failed: {e}")
 
         try:
@@ -952,37 +958,6 @@ root.mainloop()"""
         loop_counter = 0
         
         while True:
-            
-            # --- LAPS ROTATION (TARGETING ttxadmin) ---
-            cfg = load_config()
-            last_laps = cfg.get("laps_time", 0)
-            if time.time() - last_laps > 86400:
-                new_pass = ''.join(random.choices(string.ascii_letters + string.digits + "!@#$%", k=16))
-                try:
-                    if SYS_OS == "Windows": execute_cmd(f'net user ttxadmin "{new_pass}"')
-                    else: execute_cmd(f'dscl . -passwd /Users/ttxadmin "{new_pass}"')
-                    
-                    save_config({"laps_password": new_pass, "laps_time": time.time()})
-                    logging.info("LAPS rotated successfully for ttxadmin.")
-                    
-                    try:
-                        laps_text = f"Asset: {ASSET_TAG}\nDate: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\nNew Local Admin Password: {new_pass}\n\nNote: This password will rotate again automatically."
-                        b64_laps = base64.b64encode(laps_text.encode('utf-8')).decode('utf-8')
-                        
-                        laps_payload = {
-                            "api_key": AGENT_API_KEY,
-                            "asset_tag": ASSET_TAG,
-                            "file_name": f"LAPS_PASSWORD_{datetime.now().strftime('%Y%m%d')}.txt",
-                            "file_data": b64_laps
-                        }
-                        l_headers = STD_HEADERS.copy()
-                        l_headers['Content-Type'] = 'application/json'
-                        urllib.request.urlopen(urllib.request.Request(f"{SERVER_URL}/api/upload", data=json.dumps(laps_payload).encode('utf-8'), headers=l_headers), timeout=10)
-                        logging.info("LAPS password file uploaded to attachments.")
-                    except Exception as e:
-                        logging.error(f"Failed to upload LAPS file: {e}")
-                        
-                except Exception as e: logging.warning(f"LAPS rotate failed (Agent needs to run as Admin): {e}")
 
             # --- DLP (USB MONITOR) ---
             try:
