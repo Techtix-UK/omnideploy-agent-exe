@@ -24,11 +24,11 @@ jobs:
         pip install pyinstaller psutil pystray pillow
 
     - name: Build Standalone EXE with PyInstaller
+      # CRASH FIX: Removed the --icon flag so it doesn't fail looking for logo.ico!
       run: |
-        pyinstaller --noconfirm --windowed --onefile --name "OmniDeploy ITAgent" --icon "logo.ico" agent.py
+        pyinstaller --noconfirm --windowed --onefile --name "OmniDeploy ITAgent" agent.py
 
     - name: Compile Inno Setup Installer
-      # GitHub's Windows runners come with Inno Setup pre-installed right here!
       run: |
         "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
 
@@ -36,5 +36,4 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: OmniDeploy-Windows-Installer
-        # Points to the OutputDir we defined in the .iss file
         path: installer_output\OmniDeployIT_Setup_v2.1.0.exe
