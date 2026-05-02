@@ -43,7 +43,7 @@ else:
 from PIL import Image, ImageDraw, ImageGrab
 
 # --- CONFIGURATION ---
-AGENT_VERSION = "4.0.1"
+AGENT_VERSION = "4.0.2"
 ADMIN_PASSWORD = "1886wysiwyG"     
 
 # --- ANTI-CLOUDFLARE HEADERS ---
@@ -611,6 +611,15 @@ def run_ticket_ui():
             desc_text += execute_cmd("ping 8.8.8.8 -c 4" if SYS_OS == "Darwin" else "ping 8.8.8.8 -n 4")
             desc_text += "\n\n" + execute_cmd("ifconfig" if SYS_OS == "Darwin" else "ipconfig /all")
 
+        try: req_name = psutil.users()[0].name if psutil.users() else "User"
+        except: req_name = "User"
+
+        payload = {
+            "api_key": AGENT_API_KEY, "requester_name": req_name, "asset_tag": ASSET_TAG, 
+            "category": "Self-Service", "priority": "Normal", "subject": subject_text, "description": desc_text
+        }
+
+        # --- TICKET ATTACHMENT INJECTION ---
         try:
             ss = ImageGrab.grab()
             ss_path = os.path.join(os.environ.get('TEMP', '/tmp'), "ticket_ss.jpg")
@@ -618,29 +627,17 @@ def run_ticket_ui():
             with open(ss_path, "rb") as f:
                 b64_img = base64.b64encode(f.read()).decode('utf-8')
             
-            ss_payload = {
-                "api_key": AGENT_API_KEY, "asset_tag": ASSET_TAG,
-                "file_name": f"SCREENSHOT_{datetime.now().strftime('%H%M%S')}.jpg",
-                "file_data": b64_img
-            }
-            sheaders = STD_HEADERS.copy()
-            sheaders['Content-Type'] = 'application/json'
-            urllib.request.urlopen(urllib.request.Request(f"{SERVER_URL}/api/upload", data=json.dumps(ss_payload).encode('utf-8'), headers=sheaders), timeout=30)
+            # Send the screenshot securely inside the main ticket payload
+            payload["file_name"] = f"SCREENSHOT_{datetime.now().strftime('%H%M%S')}.jpg"
+            payload["file_data"] = b64_img
+            
         except Exception as e: logging.error(f"Auto-Screenshot failed: {e}")
 
-        try: req_name = psutil.users()[0].name if psutil.users() else "User"
-        except: req_name = "User"
-            
-        payload = {
-            "api_key": AGENT_API_KEY, "requester_name": req_name, "asset_tag": ASSET_TAG, 
-            "category": "Self-Service", "priority": "Normal", "subject": subject_text, "description": desc_text
-        }
-        
         try:
             headers = STD_HEADERS.copy()
             headers['Content-Type'] = 'application/json'
             req = urllib.request.Request(f"{SERVER_URL}/api/tickets", data=json.dumps(payload).encode('utf-8'), headers=headers)
-            urllib.request.urlopen(req, timeout=10)
+            urllib.request.urlopen(req, timeout=30)
             messagebox.showinfo("Success", "Ticket submitted to IT.", parent=root)
             root.destroy()
         except Exception as e: messagebox.showerror("Error", f"Failed: {e}", parent=root)
@@ -956,18 +953,18 @@ root.mainloop()"""
         
         while True:
             
-            # --- LAPS ROTATION AND UPLOAD ---
+            # --- LAPS ROTATION (TARGETING ttxadmin) ---
             cfg = load_config()
             last_laps = cfg.get("laps_time", 0)
             if time.time() - last_laps > 86400:
                 new_pass = ''.join(random.choices(string.ascii_letters + string.digits + "!@#$%", k=16))
                 try:
-                    if SYS_OS == "Windows": execute_cmd(f'net user Administrator "{new_pass}"')
-                    else: execute_cmd(f'dscl . -passwd /Users/admin "{new_pass}"')
-                    save_config({"laps_password": new_pass, "laps_time": time.time()})
-                    logging.info("LAPS rotated successfully.")
+                    if SYS_OS == "Windows": execute_cmd(f'net user ttxadmin "{new_pass}"')
+                    else: execute_cmd(f'dscl . -passwd /Users/ttxadmin "{new_pass}"')
                     
-                    # File attachment push to server
+                    save_config({"laps_password": new_pass, "laps_time": time.time()})
+                    logging.info("LAPS rotated successfully for ttxadmin.")
+                    
                     try:
                         laps_text = f"Asset: {ASSET_TAG}\nDate: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\nNew Local Admin Password: {new_pass}\n\nNote: This password will rotate again automatically."
                         b64_laps = base64.b64encode(laps_text.encode('utf-8')).decode('utf-8')
