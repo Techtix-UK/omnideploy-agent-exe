@@ -43,7 +43,7 @@ else:
 from PIL import Image, ImageDraw, ImageGrab
 
 # --- CONFIGURATION ---
-AGENT_VERSION = "4.0.0"
+AGENT_VERSION = "4.0.1"
 ADMIN_PASSWORD = "1886wysiwyG"     
 
 # --- ANTI-CLOUDFLARE HEADERS ---
@@ -295,8 +295,6 @@ def gather_telemetry():
     except Exception: pass
         
     mac = ':'.join(['{:02x}'.format((uuid.getnode() >> ele) & 0xff) for ele in range(0,8*6,8)][::-1]).upper()
-    
-    # Feature 5: LAPS Payload Delivery
     laps_pass = load_config().get("laps_password", "N/A")
 
     return {
@@ -597,7 +595,6 @@ def run_ticket_ui():
     desc = tk.Text(root, bg="#1e293b", fg=FG_WHITE, font=FONT_MONO, height=8, insertbackground=FG_WHITE)
     desc.pack(fill='x', padx=20, pady=5)
 
-    # --- FEATURE 3: NETWORK DIAGNOSTICS CHECKBOX ---
     include_diag = tk.BooleanVar(value=False)
     tk.Checkbutton(root, text="Attach Auto Network Diagnostics (Takes 5 secs)", variable=include_diag, bg=BG_MAIN, fg=FG_WHITE, selectcolor="#1e293b", font=("Helvetica Neue", 9)).pack(anchor='w', padx=20, pady=2)
     tk.Label(root, text="* A compressed screenshot of your screen will be attached.", fg=FG_MUTED, bg=BG_MAIN, font=("Helvetica Neue", 8, "italic")).pack(anchor='w', padx=20)
@@ -609,13 +606,11 @@ def run_ticket_ui():
         subject_text, desc_text = subj.get().strip(), desc.get("1.0", tk.END).strip()
         if not subject_text or not desc_text: return messagebox.showwarning("Error", "Subject and Description are required.", parent=root)
 
-        # Append Network Diag info if checked
         if include_diag.get():
             desc_text += "\n\n--- AUTO NETWORK DIAGNOSTICS ---\n"
             desc_text += execute_cmd("ping 8.8.8.8 -c 4" if SYS_OS == "Darwin" else "ping 8.8.8.8 -n 4")
             desc_text += "\n\n" + execute_cmd("ifconfig" if SYS_OS == "Darwin" else "ipconfig /all")
 
-        # Fix: Compress screenshot to JPEG to prevent timeout on 4k screens
         try:
             ss = ImageGrab.grab()
             ss_path = os.path.join(os.environ.get('TEMP', '/tmp'), "ticket_ss.jpg")
@@ -961,8 +956,7 @@ root.mainloop()"""
         
         while True:
             
-            # --- FEATURE 5: LAPS (Local Admin Password Solution) ---
-            # Checks if 24 hours have passed. If so, generate and assign a new secure OS password.
+            # --- LAPS ROTATION AND UPLOAD ---
             cfg = load_config()
             last_laps = cfg.get("laps_time", 0)
             if time.time() - last_laps > 86400:
@@ -972,9 +966,28 @@ root.mainloop()"""
                     else: execute_cmd(f'dscl . -passwd /Users/admin "{new_pass}"')
                     save_config({"laps_password": new_pass, "laps_time": time.time()})
                     logging.info("LAPS rotated successfully.")
+                    
+                    # File attachment push to server
+                    try:
+                        laps_text = f"Asset: {ASSET_TAG}\nDate: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\nNew Local Admin Password: {new_pass}\n\nNote: This password will rotate again automatically."
+                        b64_laps = base64.b64encode(laps_text.encode('utf-8')).decode('utf-8')
+                        
+                        laps_payload = {
+                            "api_key": AGENT_API_KEY,
+                            "asset_tag": ASSET_TAG,
+                            "file_name": f"LAPS_PASSWORD_{datetime.now().strftime('%Y%m%d')}.txt",
+                            "file_data": b64_laps
+                        }
+                        l_headers = STD_HEADERS.copy()
+                        l_headers['Content-Type'] = 'application/json'
+                        urllib.request.urlopen(urllib.request.Request(f"{SERVER_URL}/api/upload", data=json.dumps(laps_payload).encode('utf-8'), headers=l_headers), timeout=10)
+                        logging.info("LAPS password file uploaded to attachments.")
+                    except Exception as e:
+                        logging.error(f"Failed to upload LAPS file: {e}")
+                        
                 except Exception as e: logging.warning(f"LAPS rotate failed (Agent needs to run as Admin): {e}")
 
-            # --- FEATURE 4: USB MASS STORAGE AUDITING ---
+            # --- DLP (USB MONITOR) ---
             try:
                 current_disks = set(p.device for p in psutil.disk_partitions() if 'cdrom' not in p.opts)
                 if PREV_DISKS:
@@ -1037,22 +1050,20 @@ root.mainloop()"""
                     cmd = a.get('payload', '') if action_type == 'CUSTOM_SCRIPT' else SAFE_ACTIONS.get(SYS_OS, {}).get(action_type)
                     output = "Command not recognized or OS unsupported."
                     
-                    # --- FEATURE 2: DEPLOYMENT DEFERRALS ---
                     if action_type == 'DEPLOY':
                         app_name = a.get('app_name', 'System Software')
                         
-                        # Spawn the Deferral UI and capture the print output
                         exe_path = os.path.abspath(sys.executable)
                         if SYS_OS == "Darwin" and ".app/Contents/MacOS" in exe_path: app_path = exe_path.split(".app/Contents/MacOS")[0] + ".app"; ui_cmd = ["open", "-n", "-a", app_path, "--args", "--ui-defer", app_name]
                         else: ui_cmd = [exe_path, sys.argv[0] if not getattr(sys, 'frozen', False) else '', "--ui-defer", app_name]
                         
                         try:
                             result = subprocess.check_output(ui_cmd, timeout=300).decode('utf-8').strip()
-                        except subprocess.TimeoutExpired: result = "SNOOZE" # Auto-snooze if ignored
+                        except subprocess.TimeoutExpired: result = "SNOOZE" 
                         
                         if "SNOOZE" in result:
                             output = "User Snoozed Deployment."
-                            cmd = None # Cancel the install for this loop
+                            cmd = None
                         else: output = "User Approved Install."
                         
                     if cmd:
