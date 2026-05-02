@@ -1,0 +1,40 @@
+name: Build Windows Installer
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller psutil pystray pillow
+
+    - name: Build Standalone EXE with PyInstaller
+      run: |
+        pyinstaller --noconfirm --windowed --onefile --name "OmniDeploy ITAgent" --icon "logo.ico" agent.py
+
+    - name: Compile Inno Setup Installer
+      # GitHub's Windows runners come with Inno Setup pre-installed right here!
+      run: |
+        "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+
+    - name: Upload Installer EXE
+      uses: actions/upload-artifact@v4
+      with:
+        name: OmniDeploy-Windows-Installer
+        # Points to the OutputDir we defined in the .iss file
+        path: installer_output\OmniDeployIT_Setup_v2.1.0.exe
