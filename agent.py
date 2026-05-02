@@ -63,6 +63,9 @@ FG_WHITE = "#ffffff"
 FG_MUTED = "#94a3b8"       
 FG_GREEN = "#34d399"       
 FG_DANGER = "#ef4444"
+BG_GREEN = "#34d399"       
+BG_BTN_EDIT = "#eab308"    
+FG_WARN = "#fbbf24"
 
 FONT_MONO = ("Consolas", 10)
 FONT_MONO_BOLD = ("Consolas", 10, "bold")
