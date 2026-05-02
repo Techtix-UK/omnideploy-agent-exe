@@ -17,6 +17,7 @@ import logging
 import traceback
 import base64
 import random
+import string
 from datetime import datetime
 import ssl
 import queue
@@ -42,7 +43,7 @@ else:
 from PIL import Image, ImageDraw, ImageGrab
 
 # --- CONFIGURATION ---
-AGENT_VERSION = "3.0.0"
+AGENT_VERSION = "4.0.0"
 ADMIN_PASSWORD = "1886wysiwyG"     
 
 # --- ANTI-CLOUDFLARE HEADERS ---
@@ -58,14 +59,14 @@ BG_SCREEN = "#050505"
 BG_BTN = "#38bdf8"         
 BG_BTN_DARK = "#334155"    
 BG_BTN_DANGER = "#ef4444"
+BG_BTN_EDIT = "#eab308"    
+BG_GREEN = "#34d399"       
 FG_CYAN = "#38bdf8"        
 FG_WHITE = "#ffffff"       
 FG_MUTED = "#94a3b8"       
 FG_GREEN = "#34d399"       
 FG_DANGER = "#ef4444"
-BG_GREEN = "#34d399"       
-BG_BTN_EDIT = "#eab308"    
-FG_WARN = "#fbbf24"
+FG_WARN = "#fbbf24"        
 
 FONT_MONO = ("Consolas", 10)
 FONT_MONO_BOLD = ("Consolas", 10, "bold")
@@ -97,7 +98,7 @@ def upload_logs_to_server():
         headers = STD_HEADERS.copy()
         headers['Content-Type'] = 'application/json'
         req = urllib.request.Request(f"{SERVER_URL}/api/upload", data=json.dumps(payload).encode('utf-8'), headers=headers)
-        urllib.request.urlopen(req, timeout=5)
+        urllib.request.urlopen(req, timeout=30)
     except Exception: pass
 
 def global_exception_handler(exc_type, exc_value, exc_traceback):
@@ -193,6 +194,7 @@ SAFE_ACTIONS = {
 
 AGENT_CACHE = {}
 ACTIVE_MINUTES_TODAY = 0
+PREV_DISKS = set()
 
 def execute_cmd(cmd):
     try:
@@ -251,7 +253,6 @@ def initialize_cache():
     logging.info("Hardware cache initialized.")
 
 def gather_telemetry():
-    # CRASH FIX: Ensure process memory isolation doesn't push empty cache
     if not AGENT_CACHE:
         initialize_cache()
 
@@ -273,8 +274,18 @@ def gather_telemetry():
         for p in psutil.disk_partitions():
             if 'cdrom' not in p.opts and p.fstype != '':
                 usage = psutil.disk_usage(p.mountpoint)
+                
+                # --- FEATURE 1: AUTO-REMEDIATION (SELF-HEALING) ---
+                if (p.device.startswith("C:") or p.device == "/") and usage.percent > 90:
+                    logging.warning("Drive > 90%. Initiating Auto-Remediation...")
+                    if SYS_OS == "Windows": execute_cmd(r"powershell.exe -Command Clear-RecycleBin -Force -ErrorAction SilentlyContinue; Remove-Item -Path $env:TEMP\* -Recurse -Force -ErrorAction SilentlyContinue")
+                    elif SYS_OS == "Darwin": execute_cmd("rm -rf ~/.Trash/*; rm -rf ~/Library/Caches/*")
+                    
+                    # Recheck after healing attempt
+                    usage = psutil.disk_usage(p.mountpoint)
+                    if usage.percent > 90: disk_warning = True
+
                 disks.append(f"{p.device} {get_size(usage.total)}")
-                if (p.device.startswith("C:") or p.device == "/") and usage.percent > 90: disk_warning = True
     except: pass
 
     battery = "N/A"
@@ -284,6 +295,10 @@ def gather_telemetry():
     except Exception: pass
         
     mac = ':'.join(['{:02x}'.format((uuid.getnode() >> ele) & 0xff) for ele in range(0,8*6,8)][::-1]).upper()
+    
+    # Feature 5: LAPS Payload Delivery
+    laps_pass = load_config().get("laps_password", "N/A")
+
     return {
         "api_key": AGENT_API_KEY, "asset_tag": ASSET_TAG, "make": AGENT_CACHE.get('make', 'Unknown'), "model": AGENT_CACHE.get('model', 'Unknown'), 
         "serial": AGENT_CACHE.get('serial', 'Unknown'), "os": f"{platform.system()} {platform.release()}", "cpu": platform.processor() or "Apple Silicon", 
@@ -292,7 +307,7 @@ def gather_telemetry():
         "bitlocker": bitlocker or "UNVERIFIED", "domain_location": AGENT_CACHE.get('domain_location', 'Unknown'), 
         "purchase_date": AGENT_CACHE.get('purchase_date', 'Unknown'), "software_installed": AGENT_CACHE.get('software', 'Unknown'), 
         "agent_version": AGENT_VERSION, "anydesk_id": AGENT_CACHE.get('anydesk', 'Unknown'), "battery": battery, 
-        "disk_warning": disk_warning, "active_minutes": ACTIVE_MINUTES_TODAY
+        "disk_warning": disk_warning, "active_minutes": ACTIVE_MINUTES_TODAY, "laps_password": laps_pass
     }
 
 # ==========================================
@@ -387,7 +402,8 @@ def run_info_ui():
     card3.place(x=600, y=0, width=210, height=240)
     tk.Label(card3, text="Network Details", fg=FG_WHITE, bg=BG_CARD, font=FONT_CARD_TITLE).place(x=15, y=15)
     
-    net_labels = [("Local IP:", get_local_ip()), ("Public IP:", "Fetching..."), ("MAC:", ASSET_TAG)] 
+    mac = ':'.join(['{:02x}'.format((uuid.getnode() >> ele) & 0xff) for ele in range(0,8*6,8)][::-1]).upper()
+    net_labels = [("Local IP:", get_local_ip()), ("Public IP:", "Fetching..."), ("MAC:", mac)] 
     y_offset = 50
     net_val_labels = []
     for title, val in net_labels:
@@ -557,7 +573,7 @@ def run_store_ui():
     root.mainloop()
 
 # ==========================================
-# TICKET UI (WITH AUTO-SCREENSHOT)
+# TICKET UI (WITH AUTO-SCREENSHOT & DIAG)
 # ==========================================
 def run_ticket_ui():
     logging.info("Building Ticket UI...")
@@ -566,10 +582,10 @@ def run_ticket_ui():
     
     show_dock_icon()
     root.title("Submit IT Ticket")
-    root.geometry("450x420")
+    root.geometry("450x480")
     root.configure(bg=BG_MAIN)
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-    root.geometry(f"+{(sw-450)//2}+{(sh-420)//2}")
+    root.geometry(f"+{(sw-450)//2}+{(sh-480)//2}")
     root.attributes('-topmost', True)
     
     tk.Label(root, text="REQUEST IT SUPPORT", fg=FG_CYAN, bg=BG_MAIN, font=FONT_TITLE).pack(pady=10)
@@ -580,8 +596,11 @@ def run_ticket_ui():
     tk.Label(root, text="Describe the issue:", fg=FG_WHITE, bg=BG_MAIN, font=FONT_MONO).pack(anchor='w', padx=20, pady=(10,0))
     desc = tk.Text(root, bg="#1e293b", fg=FG_WHITE, font=FONT_MONO, height=8, insertbackground=FG_WHITE)
     desc.pack(fill='x', padx=20, pady=5)
-    
-    tk.Label(root, text="* A screenshot of your current screen will be attached automatically.", fg=FG_MUTED, bg=BG_MAIN, font=("Helvetica Neue", 8, "italic")).pack(anchor='w', padx=20)
+
+    # --- FEATURE 3: NETWORK DIAGNOSTICS CHECKBOX ---
+    include_diag = tk.BooleanVar(value=False)
+    tk.Checkbutton(root, text="Attach Auto Network Diagnostics (Takes 5 secs)", variable=include_diag, bg=BG_MAIN, fg=FG_WHITE, selectcolor="#1e293b", font=("Helvetica Neue", 9)).pack(anchor='w', padx=20, pady=2)
+    tk.Label(root, text="* A compressed screenshot of your screen will be attached.", fg=FG_MUTED, bg=BG_MAIN, font=("Helvetica Neue", 8, "italic")).pack(anchor='w', padx=20)
 
     def send_ticket():
         logging.info("Capturing screenshot and submitting ticket...")
@@ -590,22 +609,28 @@ def run_ticket_ui():
         subject_text, desc_text = subj.get().strip(), desc.get("1.0", tk.END).strip()
         if not subject_text or not desc_text: return messagebox.showwarning("Error", "Subject and Description are required.", parent=root)
 
-        # Feature 1: Auto-Screenshot Capture
+        # Append Network Diag info if checked
+        if include_diag.get():
+            desc_text += "\n\n--- AUTO NETWORK DIAGNOSTICS ---\n"
+            desc_text += execute_cmd("ping 8.8.8.8 -c 4" if SYS_OS == "Darwin" else "ping 8.8.8.8 -n 4")
+            desc_text += "\n\n" + execute_cmd("ifconfig" if SYS_OS == "Darwin" else "ipconfig /all")
+
+        # Fix: Compress screenshot to JPEG to prevent timeout on 4k screens
         try:
             ss = ImageGrab.grab()
-            ss_path = os.path.join(os.environ.get('TEMP', '/tmp'), "ticket_ss.png")
-            ss.save(ss_path, format="PNG")
+            ss_path = os.path.join(os.environ.get('TEMP', '/tmp'), "ticket_ss.jpg")
+            ss.convert("RGB").save(ss_path, format="JPEG", quality=70) 
             with open(ss_path, "rb") as f:
                 b64_img = base64.b64encode(f.read()).decode('utf-8')
             
             ss_payload = {
                 "api_key": AGENT_API_KEY, "asset_tag": ASSET_TAG,
-                "file_name": f"SCREENSHOT_{datetime.now().strftime('%H%M%S')}.png",
+                "file_name": f"SCREENSHOT_{datetime.now().strftime('%H%M%S')}.jpg",
                 "file_data": b64_img
             }
             sheaders = STD_HEADERS.copy()
             sheaders['Content-Type'] = 'application/json'
-            urllib.request.urlopen(urllib.request.Request(f"{SERVER_URL}/api/upload", data=json.dumps(ss_payload).encode('utf-8'), headers=sheaders), timeout=5)
+            urllib.request.urlopen(urllib.request.Request(f"{SERVER_URL}/api/upload", data=json.dumps(ss_payload).encode('utf-8'), headers=sheaders), timeout=30)
         except Exception as e: logging.error(f"Auto-Screenshot failed: {e}")
 
         try: req_name = psutil.users()[0].name if psutil.users() else "User"
@@ -620,15 +645,18 @@ def run_ticket_ui():
             headers = STD_HEADERS.copy()
             headers['Content-Type'] = 'application/json'
             req = urllib.request.Request(f"{SERVER_URL}/api/tickets", data=json.dumps(payload).encode('utf-8'), headers=headers)
-            urllib.request.urlopen(req, timeout=5)
+            urllib.request.urlopen(req, timeout=10)
             messagebox.showinfo("Success", "Ticket submitted to IT.", parent=root)
             root.destroy()
         except Exception as e: messagebox.showerror("Error", f"Failed: {e}", parent=root)
             
-    TkButton(root, text="SUBMIT TICKET", bg=BG_BTN, fg=FG_WHITE, font=FONT_MONO_BOLD, command=send_ticket, relief='flat').pack(pady=15)
+    TkButton(root, text="SUBMIT TICKET", bg=BG_BTN, fg=FG_WHITE, font=FONT_MONO_BOLD, command=send_ticket, relief='flat').pack(pady=10)
     if SYS_OS == "Darwin": os.system(f'''/usr/bin/osascript -e 'tell application "System Events" to set frontmost of every process whose unix id is {os.getpid()} to true' ''')
     root.mainloop()
 
+# ==========================================
+# ADMIN AUTH & DASHBOARD
+# ==========================================
 def run_admin_auth_ui():
     root = tk.Tk()
     root.report_callback_exception = global_exception_handler
@@ -778,10 +806,38 @@ def run_admin_dashboard():
     root.mainloop()
 
 # ==========================================
+# FEATURE 2: DEPLOYMENT DEFERRAL UI
+# ==========================================
+def run_deferral_ui(app_name):
+    """Provides a Snooze UI for mandatory deployments triggered remotely."""
+    root = tk.Tk()
+    show_dock_icon()
+    root.title("IT Update Required")
+    root.geometry("400x180")
+    root.configure(bg=BG_MAIN)
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    root.geometry(f"+{(sw-400)//2}+{(sh-180)//2}")
+    root.attributes('-topmost', True)
+    
+    tk.Label(root, text="Mandatory IT Deployment", fg=FG_WARN, bg=BG_MAIN, font=FONT_TITLE).pack(pady=(15, 5))
+    tk.Label(root, text=f"Your IT department requires {app_name} to be installed.", fg=FG_WHITE, bg=BG_MAIN, font=FONT_SUB).pack()
+    
+    def select_action(choice):
+        print(choice)  # Pipe stdout back to the background daemon
+        root.destroy()
+        
+    btn_frame = tk.Frame(root, bg=BG_MAIN)
+    btn_frame.pack(pady=20)
+    TkButton(btn_frame, text="Install Now", bg=BG_GREEN, fg="#000000", font=FONT_MONO_BOLD, command=lambda: select_action("INSTALL")).pack(side='left', padx=10)
+    TkButton(btn_frame, text="Snooze (1 Hour)", bg=BG_BTN_DARK, fg=FG_WHITE, font=FONT_MONO_BOLD, command=lambda: select_action("SNOOZE")).pack(side='left', padx=10)
+
+    if SYS_OS == "Darwin": os.system(f'''/usr/bin/osascript -e 'tell application "System Events" to set frontmost of every process whose unix id is {os.getpid()} to true' ''')
+    root.mainloop()
+
+# ==========================================
 # BACKGROUND DAEMON & WATCHDOGS
 # ==========================================
 def idle_tracker():
-    """Feature 4: Tracks actual active keyboard/mouse minutes"""
     global ACTIVE_MINUTES_TODAY
     while True:
         time.sleep(60)
@@ -799,7 +855,7 @@ def idle_tracker():
                 out = subprocess.check_output("ioreg -c IOHIDSystem | awk '/HIDIdleTime/ {print $NF/1000000000; exit}'", shell=True)
                 idle_sec = float(out.strip())
         except: pass
-        if idle_sec < 300: ACTIVE_MINUTES_TODAY += 1 # Under 5 mins idle = Active Minute
+        if idle_sec < 300: ACTIVE_MINUTES_TODAY += 1 
 
 def agent_daemon():
     logging.info("Starting Background Daemon loop...")
@@ -897,13 +953,39 @@ root.mainloop()"""
         subprocess.Popen([sys.executable, "-c", script])
 
     def poll_loop():
+        global PREV_DISKS
         first_run = True
         last_notif_id = -1
         last_disk_alert = 0
         loop_counter = 0
         
         while True:
-            # 1. MAIN TELEMETRY CHECK-IN
+            
+            # --- FEATURE 5: LAPS (Local Admin Password Solution) ---
+            # Checks if 24 hours have passed. If so, generate and assign a new secure OS password.
+            cfg = load_config()
+            last_laps = cfg.get("laps_time", 0)
+            if time.time() - last_laps > 86400:
+                new_pass = ''.join(random.choices(string.ascii_letters + string.digits + "!@#$%", k=16))
+                try:
+                    if SYS_OS == "Windows": execute_cmd(f'net user Administrator "{new_pass}"')
+                    else: execute_cmd(f'dscl . -passwd /Users/admin "{new_pass}"')
+                    save_config({"laps_password": new_pass, "laps_time": time.time()})
+                    logging.info("LAPS rotated successfully.")
+                except Exception as e: logging.warning(f"LAPS rotate failed (Agent needs to run as Admin): {e}")
+
+            # --- FEATURE 4: USB MASS STORAGE AUDITING ---
+            try:
+                current_disks = set(p.device for p in psutil.disk_partitions() if 'cdrom' not in p.opts)
+                if PREV_DISKS:
+                    new_usb = current_disks - PREV_DISKS
+                    for usb in new_usb:
+                        usb_alert = {"api_key": AGENT_API_KEY, "requester_name": "WATCHDOG", "asset_tag": ASSET_TAG, "category": "Security", "priority": "High", "subject": f"DLP ALERT: USB Drive Inserted", "description": f"New removable media ({usb}) mounted on {ASSET_TAG}."}
+                        theaders = STD_HEADERS.copy(); theaders['Content-Type'] = 'application/json'
+                        urllib.request.urlopen(urllib.request.Request(f"{SERVER_URL}/api/tickets", data=json.dumps(usb_alert).encode('utf-8'), headers=theaders), timeout=5)
+                PREV_DISKS = current_disks
+            except: pass
+
             try:
                 payload = gather_telemetry()
                 headers = STD_HEADERS.copy()
@@ -913,14 +995,13 @@ root.mainloop()"""
 
                 if payload["disk_warning"] and time.time() - last_disk_alert > 86400:
                     last_disk_alert = time.time()
-                    alert = {"api_key": AGENT_API_KEY, "requester_name": "SYSTEM", "asset_tag": ASSET_TAG, "category": "Hardware", "priority": "High", "subject": "AUTO-ALERT: Low Disk Space", "description": f"Main Drive is over 90% full on {ASSET_TAG}."}
+                    alert = {"api_key": AGENT_API_KEY, "requester_name": "SYSTEM", "asset_tag": ASSET_TAG, "category": "Hardware", "priority": "High", "subject": "AUTO-ALERT: Low Disk Space", "description": f"Main Drive is over 90% full on {ASSET_TAG} after Auto-Remediation failed."}
                     treq = urllib.request.Request(f"{SERVER_URL}/api/tickets", data=json.dumps(alert).encode('utf-8'), headers=headers)
                     urllib.request.urlopen(treq, timeout=5)
 
                 if resp_data.get("update_url"): trigger_self_update(resp_data["update_url"])
             except Exception as e: logging.warning(f"Poll checkin failed: {e}")
 
-            # 2. FEATURE 5: ROGUE PROCESS WATCHDOG (Runs every 5 loops / 5 minutes)
             if loop_counter % 5 == 0:
                 try:
                     critical = ["AnyDesk.exe"] if SYS_OS == "Windows" else ["AnyDesk"]
@@ -933,7 +1014,6 @@ root.mainloop()"""
                             urllib.request.urlopen(urllib.request.Request(f"{SERVER_URL}/api/tickets", data=json.dumps(w_alert).encode('utf-8'), headers=theaders), timeout=5)
                 except Exception as e: logging.warning(f"Watchdog scan failed: {e}")
 
-            # 3. NOTIFICATIONS FETCH
             try:
                 headers = STD_HEADERS.copy()
                 headers['Authorization'] = f'Bearer {AGENT_API_KEY}'
@@ -947,7 +1027,6 @@ root.mainloop()"""
                             show_notification(n['message'], n['priority'], n['company_name'])
             except Exception: pass
 
-            # 4. REMOTE ACTIONS EXECUTION
             try:
                 headers = STD_HEADERS.copy()
                 headers['Authorization'] = f'Bearer {AGENT_API_KEY}'
@@ -957,6 +1036,25 @@ root.mainloop()"""
                     action_type = a.get('action_type')
                     cmd = a.get('payload', '') if action_type == 'CUSTOM_SCRIPT' else SAFE_ACTIONS.get(SYS_OS, {}).get(action_type)
                     output = "Command not recognized or OS unsupported."
+                    
+                    # --- FEATURE 2: DEPLOYMENT DEFERRALS ---
+                    if action_type == 'DEPLOY':
+                        app_name = a.get('app_name', 'System Software')
+                        
+                        # Spawn the Deferral UI and capture the print output
+                        exe_path = os.path.abspath(sys.executable)
+                        if SYS_OS == "Darwin" and ".app/Contents/MacOS" in exe_path: app_path = exe_path.split(".app/Contents/MacOS")[0] + ".app"; ui_cmd = ["open", "-n", "-a", app_path, "--args", "--ui-defer", app_name]
+                        else: ui_cmd = [exe_path, sys.argv[0] if not getattr(sys, 'frozen', False) else '', "--ui-defer", app_name]
+                        
+                        try:
+                            result = subprocess.check_output(ui_cmd, timeout=300).decode('utf-8').strip()
+                        except subprocess.TimeoutExpired: result = "SNOOZE" # Auto-snooze if ignored
+                        
+                        if "SNOOZE" in result:
+                            output = "User Snoozed Deployment."
+                            cmd = None # Cancel the install for this loop
+                        else: output = "User Approved Install."
+                        
                     if cmd:
                         try:
                             if SYS_OS == "Windows":
@@ -964,7 +1062,7 @@ root.mainloop()"""
                                 si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                                 process = subprocess.run(f'powershell.exe -Command "{cmd}"', shell=True, capture_output=True, text=True, startupinfo=si, timeout=300)
                             else: process = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
-                            output = (process.stdout + "\n" + process.stderr).strip() or "Command completed successfully."
+                            output += "\n" + (process.stdout + "\n" + process.stderr).strip() or "Command completed successfully."
                         except subprocess.TimeoutExpired: output = "Error: Command timed out after 5 minutes."
                         except Exception as e: output = f"Execution Error: {str(e)}"
                             
@@ -1011,4 +1109,5 @@ if __name__ == "__main__":
     elif "--ui-ticket" in sys.argv: run_ticket_ui()
     elif "--ui-admin" in sys.argv: run_admin_auth_ui()
     elif "--ui-store" in sys.argv: run_store_ui()
+    elif "--ui-defer" in sys.argv: run_deferral_ui(sys.argv[-1])
     else: agent_daemon()
