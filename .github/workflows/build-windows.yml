@@ -24,13 +24,13 @@ jobs:
         pip install pyinstaller psutil pystray pillow
 
     - name: Build Standalone EXE with PyInstaller
-      # CRASH FIX: Removed the --icon flag so it doesn't fail looking for logo.ico!
       run: |
         pyinstaller --noconfirm --windowed --onefile --name "OmniDeploy ITAgent" agent.py
 
     - name: Compile Inno Setup Installer
+      # CRASH FIX: Added the '&' so PowerShell knows to execute the quoted path!
       run: |
-        "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+        & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
 
     - name: Upload Installer EXE
       uses: actions/upload-artifact@v4
