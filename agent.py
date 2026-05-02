@@ -16,10 +16,10 @@ import re
 import logging
 import traceback
 import base64
+import random
 from datetime import datetime
 import ssl
 import queue
-import random
 
 # --- MACOS SSL CERTIFICATE FIX ---
 if getattr(ssl, '_create_unverified_context', None):
@@ -38,10 +38,11 @@ else:
     import winreg as reg
     import pystray
     from pystray import MenuItem as item
-    from PIL import Image, ImageDraw
+
+from PIL import Image, ImageDraw, ImageGrab
 
 # --- CONFIGURATION ---
-AGENT_VERSION = "2.1.0"
+AGENT_VERSION = "3.0.0"
 ADMIN_PASSWORD = "1886wysiwyG"     
 
 # --- ANTI-CLOUDFLARE HEADERS ---
@@ -81,54 +82,30 @@ os.makedirs(AGENT_CONFIG_DIR, exist_ok=True)
 CONFIG_FILE = os.path.join(AGENT_CONFIG_DIR, "agent_config.json")
 LOG_FILE = os.path.join(AGENT_CONFIG_DIR, "omnideploy-logs.txt")
 
-# Setup Logging Engine
-logging.basicConfig(
-    filename=LOG_FILE, 
-    level=logging.DEBUG, 
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(filename=LOG_FILE, level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def upload_logs_to_server():
-    """Silently uploads the log file to the server as an asset attachment."""
     try:
         if not SERVER_URL or not ASSET_TAG or not AGENT_API_KEY: return
         if not os.path.exists(LOG_FILE): return
-        
-        logging.info("Initiating log file upload to server...")
         with open(LOG_FILE, "rb") as f:
             b64_data = base64.b64encode(f.read()).decode('utf-8')
-            
-        payload = {
-            "api_key": AGENT_API_KEY,
-            "asset_tag": ASSET_TAG,
-            "file_name": f"CRASH_LOG_{datetime.now().strftime('%H%M%S')}.txt",
-            "file_data": b64_data
-        }
-        
+        payload = {"api_key": AGENT_API_KEY, "asset_tag": ASSET_TAG, "file_name": f"CRASH_LOG_{datetime.now().strftime('%H%M%S')}.txt", "file_data": b64_data}
         headers = STD_HEADERS.copy()
         headers['Content-Type'] = 'application/json'
-        
         req = urllib.request.Request(f"{SERVER_URL}/api/upload", data=json.dumps(payload).encode('utf-8'), headers=headers)
         urllib.request.urlopen(req, timeout=5)
-        logging.info("Log file successfully uploaded.")
-    except Exception as e:
-        logging.error(f"Failed to upload log file: {e}")
+    except Exception: pass
 
 def global_exception_handler(exc_type, exc_value, exc_traceback):
-    """Catches absolutely any fatal crash before the app dies."""
     if issubclass(exc_type, KeyboardInterrupt):
         sys.__excepthook__(exc_type, exc_value, exc_traceback)
         return
-    
     logging.critical("UNCAUGHT FATAL EXCEPTION", exc_info=(exc_type, exc_value, exc_traceback))
-    
-    # Fire background upload and give it 2 seconds to complete before the app dies
     threading.Thread(target=upload_logs_to_server, daemon=True).start()
     time.sleep(2) 
 
-# Hook the global python error system
 sys.excepthook = global_exception_handler
-
 logging.info(f"=== OmniDeploy Agent v{AGENT_VERSION} Booting ===")
 
 def load_config():
@@ -151,8 +128,7 @@ def init_agent_identity():
         root = tk.Tk()
         root.withdraw()
         root.attributes('-topmost', True)
-        if SYS_OS == "Darwin":
-            os.system(f'''/usr/bin/osascript -e 'tell application "System Events" to set frontmost of every process whose unix id is {os.getpid()} to true' ''')
+        if SYS_OS == "Darwin": os.system(f'''/usr/bin/osascript -e 'tell application "System Events" to set frontmost of every process whose unix id is {os.getpid()} to true' ''')
         return root
 
     server_url = cfg.get("server_url")
@@ -161,7 +137,6 @@ def init_agent_identity():
         url = simpledialog.askstring("OmniDeploy Setup", "1/3: Enter Server URL\n(e.g. http://10.54.22.15:8080):")
         root.destroy()
         if not url: sys.exit(0)
-        
         server_url = url.strip().rstrip('/')
         if not server_url.startswith("http"): server_url = "http://" + server_url
         cfg["server_url"] = server_url
@@ -214,6 +189,7 @@ SAFE_ACTIONS = {
 }
 
 AGENT_CACHE = {}
+ACTIVE_MINUTES_TODAY = 0
 
 def execute_cmd(cmd):
     try:
@@ -221,8 +197,7 @@ def execute_cmd(cmd):
             si = subprocess.STARTUPINFO()
             si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             return subprocess.check_output(f'powershell.exe -Command "{cmd}"', shell=True, stderr=subprocess.DEVNULL, startupinfo=si).decode('utf-8', errors='ignore').strip()
-        else:
-            return subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL).decode('utf-8', errors='ignore').strip()
+        else: return subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL).decode('utf-8', errors='ignore').strip()
     except Exception: return ""
 
 def get_size(bytes_val):
@@ -239,9 +214,7 @@ def get_local_ip():
         ip = s.getsockname()[0]
         s.close()
         return ip
-    except Exception as e: 
-        logging.error(f"IP Fetch Error: {e}")
-        return "127.0.0.1"
+    except Exception: return "127.0.0.1"
 
 def initialize_cache():
     logging.info("Initializing hardware cache...")
@@ -275,6 +248,10 @@ def initialize_cache():
     logging.info("Hardware cache initialized.")
 
 def gather_telemetry():
+    # CRASH FIX: Ensure process memory isolation doesn't push empty cache
+    if not AGENT_CACHE:
+        initialize_cache()
+
     boot_time = datetime.fromtimestamp(psutil.boot_time())
     uptime = f"{(datetime.now() - boot_time).days} Days"
     try: current_user = psutil.users()[0].name if psutil.users() else "UNKNOWN"
@@ -285,20 +262,16 @@ def gather_telemetry():
     except Exception: pub_ip = "UNAVAILABLE"
     
     if SYS_OS == "Windows": bitlocker = execute_cmd("(Get-BitLockerVolume -MountPoint C:).ProtectionStatus")
-    elif SYS_OS == "Darwin":
-        fv_status = execute_cmd("fdesetup status")
-        bitlocker = "ON" if "FileVault is On" in fv_status else "OFF"
+    elif SYS_OS == "Darwin": bitlocker = "ON" if "FileVault is On" in execute_cmd("fdesetup status") else "OFF"
     else: bitlocker = "UNVERIFIED"
 
     disks, disk_warning = [], False
     try:
         for p in psutil.disk_partitions():
             if 'cdrom' not in p.opts and p.fstype != '':
-                try:
-                    usage = psutil.disk_usage(p.mountpoint)
-                    disks.append(f"{p.device} {get_size(usage.total)}")
-                    if (p.device.startswith("C:") or p.device == "/") and usage.percent > 90: disk_warning = True
-                except Exception: continue
+                usage = psutil.disk_usage(p.mountpoint)
+                disks.append(f"{p.device} {get_size(usage.total)}")
+                if (p.device.startswith("C:") or p.device == "/") and usage.percent > 90: disk_warning = True
     except: pass
 
     battery = "N/A"
@@ -310,47 +283,36 @@ def gather_telemetry():
     mac = ':'.join(['{:02x}'.format((uuid.getnode() >> ele) & 0xff) for ele in range(0,8*6,8)][::-1]).upper()
     return {
         "api_key": AGENT_API_KEY, "asset_tag": ASSET_TAG, "make": AGENT_CACHE.get('make', 'Unknown'), "model": AGENT_CACHE.get('model', 'Unknown'), 
-        "serial": AGENT_CACHE.get('serial', 'Unknown'), "os": f"{platform.system()} {platform.release()}", "cpu": platform.processor() if platform.processor() else "Apple Silicon", 
+        "serial": AGENT_CACHE.get('serial', 'Unknown'), "os": f"{platform.system()} {platform.release()}", "cpu": platform.processor() or "Apple Silicon", 
         "ram": get_size(psutil.virtual_memory().total), "storage": " | ".join(disks), "gpu": AGENT_CACHE.get('gpu', 'Unknown'), 
-        "ip_address": get_local_ip(), "public_ip": pub_ip, "mac_address": mac, 
-        "current_user": current_user, "uptime": uptime, "bitlocker": bitlocker or "UNVERIFIED",
-        "domain_location": AGENT_CACHE.get('domain_location', 'Unknown'), "purchase_date": AGENT_CACHE.get('purchase_date', 'Unknown'), 
-        "software_installed": AGENT_CACHE.get('software', 'Unknown'), "agent_version": AGENT_VERSION, "anydesk_id": AGENT_CACHE.get('anydesk', 'Unknown'), 
-        "battery": battery, "disk_warning": disk_warning
+        "ip_address": get_local_ip(), "public_ip": pub_ip, "mac_address": mac, "current_user": current_user, "uptime": uptime, 
+        "bitlocker": bitlocker or "UNVERIFIED", "domain_location": AGENT_CACHE.get('domain_location', 'Unknown'), 
+        "purchase_date": AGENT_CACHE.get('purchase_date', 'Unknown'), "software_installed": AGENT_CACHE.get('software', 'Unknown'), 
+        "agent_version": AGENT_VERSION, "anydesk_id": AGENT_CACHE.get('anydesk', 'Unknown'), "battery": battery, 
+        "disk_warning": disk_warning, "active_minutes": ACTIVE_MINUTES_TODAY
     }
 
-def discover_server_url():
-    if SERVER_URL:
-        try:
-            headers = STD_HEADERS.copy()
-            headers['Authorization'] = f'Bearer {AGENT_API_KEY}'
-            req = urllib.request.Request(f"{SERVER_URL}/api/checkin", data=b"", headers=headers)
-            urllib.request.urlopen(req, timeout=2)
-            return SERVER_URL
-        except Exception: pass
-    return None
-
 # ==========================================
-# SUBPROCESS UI ROUTERS & MAC DOCK FIX
+# UI SPWNER & DOCK FIX
 # ==========================================
 def spawn_ui(flag):
     logging.info(f"Spawning UI Window with flag: {flag}")
     if getattr(sys, 'frozen', False):
-        subprocess.Popen([sys.executable, flag])
-    else:
-        subprocess.Popen([sys.executable, sys.argv[0], flag])
+        exe_path = os.path.abspath(sys.executable)
+        if SYS_OS == "Darwin" and ".app/Contents/MacOS" in exe_path:
+            app_path = exe_path.split(".app/Contents/MacOS")[0] + ".app"
+            subprocess.Popen(["open", "-n", "-a", app_path, "--args", flag])
+        else: subprocess.Popen([exe_path, flag])
+    else: subprocess.Popen([sys.executable, sys.argv[0], flag])
 
 def show_dock_icon():
     if SYS_OS == "Darwin":
         try:
-            logging.info("Attempting to inject LSUIElement Dock Policy via AppKit...")
             from AppKit import NSApplication
             app = NSApplication.sharedApplication()
             app.setActivationPolicy_(0)
             app.activateIgnoringOtherApps_(True)
-            logging.info("Dock Policy successfully modified.")
-        except Exception as e: 
-            logging.error(f"AppKit Dock injection failed: {e}")
+        except Exception: pass
 
 # ==========================================
 # MODERN SYSTEM DASHBOARD
@@ -363,12 +325,8 @@ def draw_arc_meter(canvas, x, y, radius, percentage, color, title, value_text):
     canvas.create_text(x, y-10, text=value_text, fill=FG_WHITE, font=("Helvetica Neue", 12, "bold"))
 
 def run_info_ui():
-    logging.info("Building System Monitor GUI...")
     root = tk.Tk()
-    
-    # Catch errors thrown strictly inside Tkinter's callback loop
     root.report_callback_exception = global_exception_handler
-    
     show_dock_icon()
     root.title("System Monitor")
     root.configure(bg=BG_MAIN)
@@ -377,17 +335,13 @@ def run_info_ui():
     ui_queue = queue.Queue()
     def process_queue():
         try:
-            while True:
-                task = ui_queue.get_nowait()
-                task()
+            while True: ui_queue.get_nowait()()
         except queue.Empty: pass
         root.after(100, process_queue)
     process_queue()
 
-    sw = root.winfo_screenwidth()
-    sh = root.winfo_screenheight()
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
     root.geometry(f"850x620+{(sw-850)//2}+{(sh-620)//2}")
-    root.attributes('-topmost', True) 
     
     header = tk.Frame(root, bg=BG_MAIN, pady=15, padx=25)
     header.pack(fill='x')
@@ -397,8 +351,7 @@ def run_info_ui():
     
     status_frame = tk.Frame(header, bg=BG_MAIN)
     status_frame.pack(side='right')
-    tk.Label(status_frame, text=f"v{AGENT_VERSION}   ", fg=FG_MUTED, bg=BG_MAIN, font=FONT_SUB).pack(side='left')
-    tk.Label(status_frame, text="Status: ", fg=FG_WHITE, bg=BG_MAIN, font=FONT_SUB).pack(side='left')
+    tk.Label(status_frame, text=f"v{AGENT_VERSION}   Status: ", fg=FG_WHITE, bg=BG_MAIN, font=FONT_SUB).pack(side='left')
     lbl_net_status = tk.Label(status_frame, text="CHECKING...", fg=FG_MUTED, bg=BG_MAIN, font=("Helvetica Neue", 11, "bold"))
     lbl_net_status.pack(side='left')
 
@@ -410,23 +363,19 @@ def run_info_ui():
     tk.Label(card1, text="Client Identification", fg=FG_WHITE, bg=BG_CARD, font=FONT_CARD_TITLE).place(x=15, y=15)
     tk.Label(card1, text="Client Name:", fg=FG_MUTED, bg=BG_CARD, font=FONT_SUB).place(x=15, y=50)
     tk.Label(card1, text=ASSET_TAG, fg=FG_WHITE, bg=BG_CARD, font=FONT_SUB).place(x=105, y=50)
-    tk.Label(card1, text="Client ID:", fg=FG_MUTED, bg=BG_CARD, font=FONT_SUB).place(x=15, y=80)
-    tk.Label(card1, text=f"{random.randint(100,999)}", fg=FG_WHITE, bg=BG_CARD, font=FONT_SUB).place(x=105, y=80)
-    tk.Label(card1, text="Company:", fg=FG_MUTED, bg=BG_CARD, font=FONT_SUB).place(x=15, y=110)
+    tk.Label(card1, text="Company:", fg=FG_MUTED, bg=BG_CARD, font=FONT_SUB).place(x=15, y=80)
     lbl_comp = tk.Label(card1, text="Fetching...", fg=FG_WHITE, bg=BG_CARD, font=FONT_SUB)
-    lbl_comp.place(x=105, y=110)
+    lbl_comp.place(x=105, y=80)
 
     reg_date = AGENT_CACHE.get('purchase_date', datetime.now().strftime("%m/%d/%Y %H:%M:%S"))
-    tk.Label(card1, text=f"Registration Date:\n{reg_date}", fg=FG_MUTED, bg=BG_CARD, font=("Helvetica Neue", 10), justify="left").place(x=15, y=150)
-    TkButton(card1, text="View Full Profile", bg=BG_BTN_DARK, fg=FG_WHITE, font=("Helvetica Neue", 10), relief='flat').place(x=15, y=195, width=220, height=30)
+    tk.Label(card1, text=f"Registration Date:\n{reg_date}", fg=FG_MUTED, bg=BG_CARD, font=("Helvetica Neue", 10)).place(x=15, y=130)
+    TkButton(card1, text="Software Center", bg=BG_BTN, fg=FG_WHITE, font=("Helvetica Neue", 10, "bold"), relief='flat', command=lambda: [root.destroy(), spawn_ui('--ui-store')]).place(x=15, y=195, width=220, height=30)
 
     card2 = tk.Frame(content, bg=BG_CARD, highlightbackground="#334155", highlightthickness=1)
     card2.place(x=265, y=0, width=320, height=240)
     tk.Label(card2, text="System Performance", fg=FG_WHITE, bg=BG_CARD, font=FONT_CARD_TITLE).place(x=15, y=15)
-    
     meter_canvas = tk.Canvas(card2, width=310, height=100, bg=BG_CARD, highlightthickness=0)
     meter_canvas.place(x=5, y=50)
-    
     tk.Label(card2, text=f"OS: {platform.system()} ({platform.release()})", fg=FG_WHITE, bg=BG_CARD, font=FONT_SUB).place(x=15, y=160)
     lbl_uptime = tk.Label(card2, text="Uptime: Calculating...", fg=FG_WHITE, bg=BG_CARD, font=FONT_SUB)
     lbl_uptime.place(x=15, y=190)
@@ -435,14 +384,7 @@ def run_info_ui():
     card3.place(x=600, y=0, width=210, height=240)
     tk.Label(card3, text="Network Details", fg=FG_WHITE, bg=BG_CARD, font=FONT_CARD_TITLE).place(x=15, y=15)
     
-    mac = ':'.join(['{:02x}'.format((uuid.getnode() >> ele) & 0xff) for ele in range(0,8*6,8)][::-1]).upper()
-    net_labels = [
-        ("Local IP:", get_local_ip()), 
-        ("Public IP:", "Fetching..."),
-        ("MAC:", mac),
-        ("Gateway:", "Auto-DHCP")
-    ]
-    
+    net_labels = [("Local IP:", get_local_ip()), ("Public IP:", "Fetching..."), ("MAC:", ASSET_TAG)] 
     y_offset = 50
     net_val_labels = []
     for title, val in net_labels:
@@ -451,13 +393,11 @@ def run_info_ui():
         v_lbl.place(x=80, y=y_offset)
         net_val_labels.append(v_lbl)
         y_offset += 35
-        
     tk.Label(card3, text="● 1 Gbps | Stable", fg=FG_GREEN, bg=BG_CARD, font=("Helvetica Neue", 11, "bold")).place(x=40, y=200)
 
     card4 = tk.Frame(content, bg=BG_CARD, highlightbackground="#334155", highlightthickness=1)
     card4.place(x=0, y=255, width=810, height=230)
     tk.Label(card4, text="Drive Summary", fg=FG_WHITE, bg=BG_CARD, font=FONT_CARD_TITLE).place(x=15, y=15)
-    
     drive_canvas = tk.Canvas(card4, width=780, height=180, bg=BG_CARD, highlightthickness=0)
     drive_canvas.place(x=15, y=45)
 
@@ -469,43 +409,19 @@ def run_info_ui():
             try:
                 usage = psutil.disk_usage(p.mountpoint)
                 pct = usage.percent
-                total_str = get_size(usage.total)
-                free_str = get_size(usage.free)
-                
                 drive_canvas.create_text(0, y_pos, anchor="w", text=f"{p.device}", fill=FG_WHITE, font=FONT_SUB)
-                drive_canvas.create_text(780, y_pos, anchor="e", text=f"{total_str} Total | {free_str} Free ({pct}% used)", fill=FG_MUTED, font=("Helvetica Neue", 10))
-                
                 drive_canvas.create_rectangle(0, y_pos+15, 780, y_pos+23, fill="#334155", outline="")
-                fill_color = FG_DANGER if pct > 90 else FG_CYAN
-                fill_width = int(max(1, 780 * (pct / 100)))
-                drive_canvas.create_rectangle(0, y_pos+15, fill_width, y_pos+23, fill=fill_color, outline="")
+                drive_canvas.create_rectangle(0, y_pos+15, int(max(1, 780*(pct/100))), y_pos+23, fill=FG_DANGER if pct > 90 else FG_CYAN, outline="")
+                drive_canvas.create_text(780, y_pos, anchor="e", text=f"{get_size(usage.total)} Total | {get_size(usage.free)} Free ({pct}% used)", fill=FG_MUTED, font=("Helvetica Neue", 10))
                 y_pos += 35
             except: continue
     except: pass
 
     footer = tk.Frame(root, bg=BG_MAIN, pady=10, padx=20)
     footer.pack(side='bottom', fill='x')
-    tk.Label(footer, text="Last Sync: Just now", fg=FG_MUTED, bg=BG_MAIN, font=FONT_SUB).pack(side='left')
-    TkButton(footer, text="Report Issue", bg=BG_BTN, fg=FG_WHITE, font=("Helvetica Neue", 10, "bold"), relief='flat', command=lambda: [root.destroy(), spawn_ui('--ui-ticket')]).pack(side='right', padx=5, ipadx=10, ipady=4)
+    TkButton(footer, text="Report Issue", bg=BG_BTN_DANGER, fg=FG_WHITE, font=("Helvetica Neue", 10, "bold"), relief='flat', command=lambda: [root.destroy(), spawn_ui('--ui-ticket')]).pack(side='right', padx=5, ipadx=10, ipady=4)
 
-    def fetch_async_data():
-        logging.info("Thread: Fetching async network and server data...")
-        try:
-            headers = STD_HEADERS.copy()
-            headers['Authorization'] = f'Bearer {AGENT_API_KEY}'
-            req = urllib.request.Request(f"{SERVER_URL}/api/checkin", data=b"", headers=headers)
-            urllib.request.urlopen(req, timeout=2)
-            ui_queue.put(lambda: lbl_net_status.config(text="ONLINE", fg=FG_GREEN))
-        except Exception as e:
-            logging.error(f"Thread checkin error: {e}")
-            ui_queue.put(lambda: lbl_net_status.config(text="OFFLINE", fg=FG_DANGER))
-
-        try: 
-            req = urllib.request.Request('https://api.ipify.org', headers=STD_HEADERS)
-            pub_ip = urllib.request.urlopen(req, timeout=3).read().decode('utf8')
-            ui_queue.put(lambda: net_val_labels[1].config(text=pub_ip))
-        except: pass
-
+    def fetch_async():
         try:
             req = urllib.request.Request(f"{SERVER_URL}/status", headers=STD_HEADERS)
             html = urllib.request.urlopen(req, timeout=3).read().decode('utf-8')
@@ -514,42 +430,132 @@ def run_info_ui():
                 comp = match.group(1) or match.group(2)
                 ui_queue.put(lambda: lbl_comp.config(text=comp))
                 ui_queue.put(lambda: lbl_comp_header.config(text=f" | {comp}"))
-            else:
-                ui_queue.put(lambda: lbl_comp.config(text="IT Support"))
-        except Exception as e:
-            logging.error(f"Thread status fetch error: {e}")
-            ui_queue.put(lambda: lbl_comp.config(text="Offline / Unknown"))
+            ui_queue.put(lambda: lbl_net_status.config(text="ONLINE", fg=FG_GREEN))
+        except: ui_queue.put(lambda: lbl_net_status.config(text="OFFLINE", fg=FG_DANGER))
+        try:
+            req2 = urllib.request.Request('https://api.ipify.org', headers=STD_HEADERS)
+            pub_ip = urllib.request.urlopen(req2, timeout=3).read().decode('utf8')
+            ui_queue.put(lambda: net_val_labels[1].config(text=pub_ip))
+        except: pass
 
-    threading.Thread(target=fetch_async_data, daemon=True).start()
+    threading.Thread(target=fetch_async, daemon=True).start()
 
     def update_metrics():
         try:
             meter_canvas.delete("all")
-            cpu_pct = psutil.cpu_percent(interval=None)
-            draw_arc_meter(meter_canvas, 50, 70, 40, cpu_pct, FG_CYAN, "CPU Load", f"{cpu_pct}%")
-            ram = psutil.virtual_memory()
-            draw_arc_meter(meter_canvas, 155, 70, 40, ram.percent, FG_CYAN, "RAM Usage", f"{get_size(ram.used)}")
-            procs = len(psutil.pids())
-            draw_arc_meter(meter_canvas, 260, 70, 40, min(100, procs/3), FG_CYAN, "Processes", f"{procs}")
-            
-            boot_time = psutil.boot_time()
-            delta = time.time() - boot_time
-            days, rem = divmod(delta, 86400)
-            hours, rem = divmod(rem, 3600)
-            lbl_uptime.config(text=f"Uptime: {int(days)} Days, {int(hours)} Hrs, {int(rem//60)} Min")
-        except Exception as e:
-            logging.error(f"Metrics update crash: {e}")
-            
+            draw_arc_meter(meter_canvas, 50, 70, 40, psutil.cpu_percent(), FG_CYAN, "CPU Load", f"{psutil.cpu_percent()}%")
+            draw_arc_meter(meter_canvas, 155, 70, 40, psutil.virtual_memory().percent, FG_CYAN, "RAM Usage", f"{get_size(psutil.virtual_memory().used)}")
+            draw_arc_meter(meter_canvas, 260, 70, 40, min(100, len(psutil.pids())/3), FG_CYAN, "Processes", f"{len(psutil.pids())}")
+        except: pass
         root.after(2000, update_metrics)
 
     update_metrics()
-    
-    if SYS_OS == "Darwin":
-        os.system(f'''/usr/bin/osascript -e 'tell application "System Events" to set frontmost of every process whose unix id is {os.getpid()} to true' ''')
-        
-    logging.info("System Monitor GUI entering mainloop.")
+    if SYS_OS == "Darwin": os.system(f'''/usr/bin/osascript -e 'tell application "System Events" to set frontmost of every process whose unix id is {os.getpid()} to true' ''')
     root.mainloop()
 
+# ==========================================
+# SOFTWARE CENTER (APP STORE)
+# ==========================================
+def run_store_ui():
+    root = tk.Tk()
+    root.report_callback_exception = global_exception_handler
+    show_dock_icon()
+    root.title(f"Software Center - {ASSET_TAG}")
+    root.geometry("600x500")
+    root.configure(bg=BG_MAIN)
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    root.geometry(f"+{(sw-600)//2}+{(sh-500)//2}")
+    
+    ui_queue = queue.Queue()
+    def process_queue():
+        try:
+            while True: ui_queue.get_nowait()()
+        except queue.Empty: pass
+        root.after(100, process_queue)
+    process_queue()
+
+    tk.Label(root, text="Software Center", fg=FG_CYAN, bg=BG_MAIN, font=FONT_TITLE).pack(pady=10)
+    tk.Label(root, text="Select an application below to securely install it.", fg=FG_MUTED, bg=BG_MAIN, font=FONT_SUB).pack()
+
+    listbox = tk.Listbox(root, bg=BG_SCREEN, fg=FG_WHITE, font=FONT_MONO, height=12)
+    listbox.pack(fill='both', expand=True, padx=20, pady=10)
+
+    catalog = []
+    
+    def _log(msg):
+        ui_queue.put(lambda: lbl_status.config(text=msg))
+
+    lbl_status = tk.Label(root, text="Loading Approved Software...", fg=FG_WHITE, bg=BG_MAIN, font=FONT_MONO)
+    lbl_status.pack(pady=5)
+
+    def load_software():
+        try:
+            nonlocal catalog
+            headers = STD_HEADERS.copy()
+            headers['Authorization'] = f'Bearer {AGENT_API_KEY}'
+            req = urllib.request.Request(f"{SERVER_URL}/api/software", headers=headers)
+            raw_catalog = json.loads(urllib.request.urlopen(req, timeout=5).read().decode('utf-8'))
+            my_os = "macOS" if SYS_OS == "Darwin" else "Windows"
+            catalog = [p for p in raw_catalog if p.get('os', 'Both') in [my_os, 'Both']]
+            ui_queue.put(lambda: [listbox.insert(tk.END, p['name']) for p in catalog])
+            _log(f"Found {len(catalog)} available applications.")
+        except Exception as e: _log(f"Error fetching catalog: {e}")
+
+    threading.Thread(target=load_software, daemon=True).start()
+
+    def start_install():
+        sel = listbox.curselection()
+        if not sel: return
+        pkg = catalog[sel[0]]
+        
+        def _deploy():
+            _log(f"Downloading {pkg['name']}...")
+            url_lower = pkg['url'].lower()
+            ext = ".msi" if url_lower.endswith(".msi") else ".exe" if SYS_OS == "Windows" else ".dmg" if ".dmg" in url_lower else ".zip" if ".zip" in url_lower else ".pkg"
+            dp = os.path.join(os.environ.get('TEMP', '/tmp'), f"agent_temp_install{ext}")
+            try:
+                req = urllib.request.Request(pkg['url'], headers=STD_HEADERS)
+                with urllib.request.urlopen(req) as response, open(dp, 'wb') as out_file: out_file.write(response.read())
+            except Exception as e:
+                _log(f"Download failed: {e}")
+                return
+                
+            _log(f"Installing {pkg['name']} silently in background...")
+            try:
+                if SYS_OS == "Windows":
+                    cmd = f'msiexec.exe /i "{dp}" {pkg["args"]}' if ext == ".msi" else f'"{dp}" {pkg["args"]}'
+                    si = subprocess.STARTUPINFO()
+                    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    subprocess.run(cmd, shell=True, check=True, startupinfo=si)
+                elif SYS_OS == "Darwin":
+                    if ext == ".pkg": subprocess.run(f'sudo installer -pkg "{dp}" -target /', shell=True, check=True) 
+                    elif ext == ".zip": subprocess.run(f'unzip -q -o "{dp}" -d /Applications/', shell=True, check=True)
+                    elif ext == ".dmg":
+                        mnt = "/Volumes/OmniDeployTemp"
+                        subprocess.run(f'hdiutil attach "{dp}" -mountpoint "{mnt}" -nobrowse -quiet', shell=True, check=True)
+                        subprocess.run(f'cp -R "{mnt}"/*.app /Applications/ 2>/dev/null || true', shell=True, check=True)
+                        subprocess.run(f'hdiutil detach "{mnt}" -quiet', shell=True, check=True)
+                _log(f"{pkg['name']} successfully installed!")
+                ui_queue.put(lambda: messagebox.showinfo("Success", f"{pkg['name']} has been installed.", parent=root))
+            except Exception as e: _log(f"Install Failed: {e}")
+            finally:
+                if os.path.exists(dp):
+                    try: os.remove(dp)
+                    except: pass
+
+        threading.Thread(target=_deploy, daemon=True).start()
+
+    btn_frame = tk.Frame(root, bg=BG_MAIN)
+    btn_frame.pack(pady=10)
+    TkButton(btn_frame, text="INSTALL", bg=BG_GREEN, fg="#000000", font=FONT_MONO_BOLD, command=start_install).pack(side='left', padx=10)
+    TkButton(btn_frame, text="CANCEL", bg=BG_BTN_DARK, fg=FG_WHITE, font=FONT_MONO_BOLD, command=root.destroy).pack(side='left', padx=10)
+
+    if SYS_OS == "Darwin": os.system(f'''/usr/bin/osascript -e 'tell application "System Events" to set frontmost of every process whose unix id is {os.getpid()} to true' ''')
+    root.mainloop()
+
+# ==========================================
+# TICKET UI (WITH AUTO-SCREENSHOT)
+# ==========================================
 def run_ticket_ui():
     logging.info("Building Ticket UI...")
     root = tk.Tk()
@@ -557,11 +563,10 @@ def run_ticket_ui():
     
     show_dock_icon()
     root.title("Submit IT Ticket")
-    root.geometry("450x400")
+    root.geometry("450x420")
     root.configure(bg=BG_MAIN)
-    sw = root.winfo_screenwidth()
-    sh = root.winfo_screenheight()
-    root.geometry(f"450x400+{(sw-450)//2}+{(sh-400)//2}")
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    root.geometry(f"+{(sw-450)//2}+{(sh-420)//2}")
     root.attributes('-topmost', True)
     
     tk.Label(root, text="REQUEST IT SUPPORT", fg=FG_CYAN, bg=BG_MAIN, font=FONT_TITLE).pack(pady=10)
@@ -572,40 +577,52 @@ def run_ticket_ui():
     tk.Label(root, text="Describe the issue:", fg=FG_WHITE, bg=BG_MAIN, font=FONT_MONO).pack(anchor='w', padx=20, pady=(10,0))
     desc = tk.Text(root, bg="#1e293b", fg=FG_WHITE, font=FONT_MONO, height=8, insertbackground=FG_WHITE)
     desc.pack(fill='x', padx=20, pady=5)
+    
+    tk.Label(root, text="* A screenshot of your current screen will be attached automatically.", fg=FG_MUTED, bg=BG_MAIN, font=("Helvetica Neue", 8, "italic")).pack(anchor='w', padx=20)
 
     def send_ticket():
-        logging.info("Submitting ticket...")
-        if not SERVER_URL:
-            return messagebox.showerror("Error", "No Server URL configured.", parent=root)
-            
+        logging.info("Capturing screenshot and submitting ticket...")
+        if not SERVER_URL: return messagebox.showerror("Error", "No Server URL configured.", parent=root)
+        
         subject_text, desc_text = subj.get().strip(), desc.get("1.0", tk.END).strip()
-        if not subject_text or not desc_text: 
-            return messagebox.showwarning("Error", "Subject and Description are required.", parent=root)
+        if not subject_text or not desc_text: return messagebox.showwarning("Error", "Subject and Description are required.", parent=root)
+
+        # Feature 1: Auto-Screenshot Capture
+        try:
+            ss = ImageGrab.grab()
+            ss_path = os.path.join(os.environ.get('TEMP', '/tmp'), "ticket_ss.png")
+            ss.save(ss_path, format="PNG")
+            with open(ss_path, "rb") as f:
+                b64_img = base64.b64encode(f.read()).decode('utf-8')
+            
+            ss_payload = {
+                "api_key": AGENT_API_KEY, "asset_tag": ASSET_TAG,
+                "file_name": f"SCREENSHOT_{datetime.now().strftime('%H%M%S')}.png",
+                "file_data": b64_img
+            }
+            sheaders = STD_HEADERS.copy()
+            sheaders['Content-Type'] = 'application/json'
+            urllib.request.urlopen(urllib.request.Request(f"{SERVER_URL}/api/upload", data=json.dumps(ss_payload).encode('utf-8'), headers=sheaders), timeout=5)
+        except Exception as e: logging.error(f"Auto-Screenshot failed: {e}")
+
         try: req_name = psutil.users()[0].name if psutil.users() else "User"
-        except Exception: req_name = "User"
+        except: req_name = "User"
             
         payload = {
-            "api_key": AGENT_API_KEY, 
-            "requester_name": req_name, 
-            "asset_tag": ASSET_TAG, 
-            "category": "Self-Service", 
-            "priority": "Normal", 
-            "subject": subject_text, 
-            "description": desc_text
+            "api_key": AGENT_API_KEY, "requester_name": req_name, "asset_tag": ASSET_TAG, 
+            "category": "Self-Service", "priority": "Normal", "subject": subject_text, "description": desc_text
         }
+        
         try:
             headers = STD_HEADERS.copy()
             headers['Content-Type'] = 'application/json'
             req = urllib.request.Request(f"{SERVER_URL}/api/tickets", data=json.dumps(payload).encode('utf-8'), headers=headers)
             urllib.request.urlopen(req, timeout=5)
             messagebox.showinfo("Success", "Ticket submitted to IT.", parent=root)
-            logging.info("Ticket submitted successfully.")
             root.destroy()
-        except Exception as e: 
-            logging.error(f"Ticket submit failed: {e}")
-            messagebox.showerror("Error", f"Failed to submit ticket.\n{e}", parent=root)
+        except Exception as e: messagebox.showerror("Error", f"Failed: {e}", parent=root)
             
-    TkButton(root, text="SUBMIT TICKET", bg=BG_BTN, fg=FG_WHITE, font=FONT_MONO_BOLD, command=send_ticket, relief='flat').pack(pady=20)
+    TkButton(root, text="SUBMIT TICKET", bg=BG_BTN, fg=FG_WHITE, font=FONT_MONO_BOLD, command=send_ticket, relief='flat').pack(pady=15)
     if SYS_OS == "Darwin": os.system(f'''/usr/bin/osascript -e 'tell application "System Events" to set frontmost of every process whose unix id is {os.getpid()} to true' ''')
     root.mainloop()
 
@@ -629,8 +646,7 @@ def run_admin_auth_ui():
         if ent.get() == ADMIN_PASSWORD:
             root.destroy()
             run_admin_dashboard()
-        else:
-            messagebox.showerror("Error", "Access Denied.")
+        else: messagebox.showerror("Error", "Access Denied.")
             
     ent.bind('<Return>', on_submit)
     TkButton(root, text="LOGIN", bg=BG_BTN, fg=FG_WHITE, font=FONT_MONO_BOLD, command=on_submit, relief='flat').pack(pady=5)
@@ -648,9 +664,7 @@ def run_admin_dashboard():
     ui_queue = queue.Queue()
     def process_queue():
         try:
-            while True:
-                task = ui_queue.get_nowait()
-                task()
+            while True: ui_queue.get_nowait()()
         except queue.Empty: pass
         root.after(100, process_queue)
     process_queue()
@@ -660,12 +674,7 @@ def run_admin_dashboard():
     top_frame.pack(fill='x', padx=20)
     tk.Label(top_frame, text=f"OMNIDEPLOY IT AGENT", fg=FG_CYAN, bg=BG_MAIN, font=FONT_TITLE).pack(side='left')
 
-    def _log(msg):
-        ui_queue.put(lambda: __log(msg))
-        
-    def __log(msg):
-        console.insert(tk.END, msg + "\n")
-        console.see(tk.END)
+    def _log(msg): ui_queue.put(lambda: console.insert(tk.END, msg + "\n") or console.see(tk.END))
 
     def sync_hw():
         _log("\n[*] Updating Master IT Suite...")
@@ -675,8 +684,7 @@ def run_admin_dashboard():
             req = urllib.request.Request(f"{SERVER_URL}/api/checkin", data=json.dumps(gather_telemetry()).encode('utf-8'), headers=headers)
             urllib.request.urlopen(req, timeout=10)
             _log("[+] SUCCESS.")
-        except Exception as e: 
-            _log(f"[-] ERROR: {e}")
+        except Exception as e: _log(f"[-] ERROR: {e}")
 
     def load_software():
         _log("\n[*] Requesting catalog...")
@@ -690,8 +698,7 @@ def run_admin_dashboard():
             catalog = [p for p in raw_catalog if p.get('os', 'Both') in [my_os, 'Both']]
             _log(f"[+] Found {len(catalog)} packages built for {my_os}.")
             ui_queue.put(render_list)
-        except Exception as e: 
-            _log(f"[-] ERROR fetching catalog: {e}")
+        except Exception as e: _log(f"[-] ERROR fetching catalog: {e}")
 
     ctrl_frame = tk.Frame(root, bg=BG_MAIN, pady=10)
     ctrl_frame.pack(fill='x', padx=20)
@@ -726,16 +733,10 @@ def run_admin_dashboard():
         pkgs = [p for p in catalog if p['name'] == item] if deploy_mode.get() == "INDIVIDUAL" else [p for p in catalog if item.replace("GROUP: ", "").strip() in [g.strip() for g in str(p.get('groups', 'UNGROUPED')).split(',')]]
         
         def _deploy():
-            _log(f"\n[*] Deploying {len(pkgs)} item(s).")
             for pkg in pkgs:
                 _log(f"--- {pkg['name']} ---")
                 url_lower = pkg['url'].lower()
-                if SYS_OS == "Windows": ext = ".msi" if url_lower.endswith(".msi") else ".exe"
-                else:
-                    if ".dmg" in url_lower: ext = ".dmg"
-                    elif ".zip" in url_lower: ext = ".zip"
-                    else: ext = ".pkg" 
-                    
+                ext = ".msi" if url_lower.endswith(".msi") else ".exe" if SYS_OS == "Windows" else ".dmg" if ".dmg" in url_lower else ".zip" if ".zip" in url_lower else ".pkg"
                 dp = os.path.join(os.environ.get('TEMP', '/tmp'), f"agent_temp_install{ext}")
                 try: 
                     req = urllib.request.Request(pkg['url'], headers=STD_HEADERS)
@@ -751,11 +752,8 @@ def run_admin_dashboard():
                         subprocess.run(cmd, shell=True, check=True, startupinfo=si)
                     elif SYS_OS == "Darwin":
                         if ext == ".pkg": subprocess.run(f'sudo installer -pkg "{dp}" -target /', shell=True, check=True) 
-                        elif ext == ".zip":
-                            _log("[*] Extracting ZIP to Applications...")
-                            subprocess.run(f'unzip -q -o "{dp}" -d /Applications/', shell=True, check=True)
+                        elif ext == ".zip": subprocess.run(f'unzip -q -o "{dp}" -d /Applications/', shell=True, check=True)
                         elif ext == ".dmg":
-                            _log("[*] Mounting DMG...")
                             mnt = "/Volumes/OmniDeployTemp"
                             subprocess.run(f'hdiutil attach "{dp}" -mountpoint "{mnt}" -nobrowse -quiet', shell=True, check=True)
                             subprocess.run(f'cp -R "{mnt}"/*.app /Applications/ 2>/dev/null || true', shell=True, check=True)
@@ -771,15 +769,35 @@ def run_admin_dashboard():
         if pkgs: threading.Thread(target=_deploy, daemon=True).start()
 
     TkButton(deploy_frame, text="DEPLOY SELECTED", bg="#008800", fg=FG_WHITE, font=FONT_MONO, command=start_deploy).pack(anchor='e')
-
     tk.Label(root, text="AGENT TERMINAL:", fg=FG_CYAN, bg=BG_MAIN, font=FONT_MONO).pack(anchor='w', padx=20)
     console = tk.Text(root, bg=BG_SCREEN, fg=FG_GREEN, font=FONT_MONO, height=12)
     console.pack(fill='both', expand=True, padx=20, pady=(0,20))
     root.mainloop()
 
 # ==========================================
-# BACKGROUND DAEMON (No UI)
+# BACKGROUND DAEMON & WATCHDOGS
 # ==========================================
+def idle_tracker():
+    """Feature 4: Tracks actual active keyboard/mouse minutes"""
+    global ACTIVE_MINUTES_TODAY
+    while True:
+        time.sleep(60)
+        idle_sec = 0
+        try:
+            if SYS_OS == "Windows":
+                import ctypes
+                class LASTINPUTINFO(ctypes.Structure):
+                    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_ulong)]
+                lii = LASTINPUTINFO()
+                lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
+                ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii))
+                idle_sec = (ctypes.windll.kernel32.GetTickCount() - lii.dwTime) / 1000.0
+            elif SYS_OS == "Darwin":
+                out = subprocess.check_output("ioreg -c IOHIDSystem | awk '/HIDIdleTime/ {print $NF/1000000000; exit}'", shell=True)
+                idle_sec = float(out.strip())
+        except: pass
+        if idle_sec < 300: ACTIVE_MINUTES_TODAY += 1 # Under 5 mins idle = Active Minute
+
 def agent_daemon():
     logging.info("Starting Background Daemon loop...")
     def create_image():
@@ -795,7 +813,7 @@ def agent_daemon():
                     key = reg.OpenKey(reg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, reg.KEY_SET_VALUE)
                     reg.SetValueEx(key, "OmniDeployAgent", 0, reg.REG_SZ, f'"{exe_path}"')
                     reg.CloseKey(key)
-                except Exception: pass
+                except: pass
             elif SYS_OS == "Darwin":
                 try:
                     plist_dir = os.path.expanduser("~/Library/LaunchAgents")
@@ -803,11 +821,9 @@ def agent_daemon():
                     plist_path = os.path.join(plist_dir, "com.omnideploy.agent.plist")
                     plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict><key>Label</key><string>com.omnideploy.agent</string><key>ProgramArguments</key><array><string>{exe_path}</string></array><key>RunAtLoad</key><true/></dict>
-</plist>"""
+<plist version="1.0"><dict><key>Label</key><string>com.omnideploy.agent</string><key>ProgramArguments</key><array><string>{exe_path}</string></array><key>RunAtLoad</key><true/></dict></plist>"""
                     with open(plist_path, 'w') as f: f.write(plist_content)
-                except Exception: pass
+                except: pass
                 
     def trigger_self_update(url):
         if not getattr(sys, 'frozen', False): return
@@ -835,72 +851,56 @@ def agent_daemon():
                 os.chmod(sh_path, 0o755)
                 subprocess.Popen(["/bin/bash", sh_path], start_new_session=True)
             os._exit(0)
-        except Exception as e: 
-            logging.error(f"Self-Update failed: {e}")
+        except Exception as e: logging.error(f"Self-Update failed: {e}")
 
     def show_notification(message, priority, comp_name):
-        import textwrap
-        msg_esc = message.replace('"', '\\"')
-        comp_esc = comp_name.replace('"', '\\"')
         script = f"""
 import tkinter as tk
-import platform
-import os
-import subprocess
-
+import platform, os, subprocess
 SYS_OS = platform.system()
 if SYS_OS == "Darwin":
     try: from tkmacosx import Button as TkButton
     except: TkButton = tk.Button
 else: TkButton = tk.Button
-
 root = tk.Tk()
 root.withdraw()
 root.overrideredirect(True)
 root.attributes('-topmost', True)
-
 bg_color = '{BG_BTN_EDIT}' if '{priority}' == 'MEDIUM' else '{BG_BTN_DANGER}' if '{priority}' in ['HIGH', 'RESTART'] else '{BG_BTN}'
 root.configure(bg=bg_color)
-
 def force_front():
-    root.deiconify()
-    root.lift()
-    root.attributes('-topmost', True)
-    if SYS_OS == "Darwin":
-        os.system('''/usr/bin/osascript -e 'tell application "System Events" to set frontmost of every process whose unix id is ''' + str(os.getpid()) + ''' to true' ''')
-
+    root.deiconify(); root.lift(); root.attributes('-topmost', True)
+    if SYS_OS == "Darwin": os.system('''/usr/bin/osascript -e 'tell application "System Events" to set frontmost of every process whose unix id is ''' + str(os.getpid()) + ''' to true' ''')
 if '{priority}' in ['LOW', 'MEDIUM']:
     w, h = 350, 120
     root.geometry(f"{{w}}x{{h}}+{{root.winfo_screenwidth() - w - 20}}+{{root.winfo_screenheight() - h - 60}}")
-    tk.Label(root, text="{comp_esc} IT ALERT", fg="{FG_WHITE}", bg=bg_color, font={FONT_MONO_BOLD}).pack(pady=(10, 5))
-    tk.Label(root, text="{msg_esc}", fg="{FG_WHITE}", bg=bg_color, font={FONT_MONO}, wraplength=330).pack()
+    tk.Label(root, text="{comp_name} IT ALERT", fg="{FG_WHITE}", bg=bg_color, font={FONT_MONO_BOLD}).pack(pady=(10, 5))
+    tk.Label(root, text="{message}", fg="{FG_WHITE}", bg=bg_color, font={FONT_MONO}, wraplength=330).pack()
     root.after(10000, root.destroy)
 else:
     w, h = 600, 300
     root.geometry(f"{{w}}x{{h}}+{{(root.winfo_screenwidth() - w) // 2}}+{{(root.winfo_screenheight() - h) // 2}}")
-    tk.Label(root, text="{comp_esc} IT ALERT", fg="{FG_WARN}", bg=bg_color, font=("Consolas", 20, "bold")).pack(pady=(30, 10))
-    tk.Label(root, text="{msg_esc}", fg="{FG_WHITE}", bg=bg_color, font=("Consolas", 12), wraplength=560, justify="center").pack(pady=20)
+    tk.Label(root, text="{comp_name} IT ALERT", fg="{FG_WARN}", bg=bg_color, font=("Consolas", 20, "bold")).pack(pady=(30, 10))
+    tk.Label(root, text="{message}", fg="{FG_WHITE}", bg=bg_color, font=("Consolas", 12), wraplength=560, justify="center").pack(pady=20)
     btn_frame = tk.Frame(root, bg=bg_color)
     btn_frame.pack(side='bottom', pady=30)
-    
     if '{priority}' == 'RESTART':
         cmd = "shutdown /r /t 5" if SYS_OS == "Windows" else "osascript -e 'tell app \\"System Events\\" to restart'"
         TkButton(btn_frame, text="RESTART NOW", bg="#111111", fg="{FG_WHITE}", font={FONT_MONO_BOLD}, command=lambda: [subprocess.run(cmd, shell=True), root.destroy()], relief='flat').pack(side='left', padx=10)
         TkButton(btn_frame, text="SNOOZE", bg="#111111", fg="{FG_WHITE}", font={FONT_MONO_BOLD}, command=root.destroy, relief='flat').pack(side='left', padx=10)
-    else:
-        TkButton(btn_frame, text="ACKNOWLEDGE", bg="#111111", fg="{FG_WHITE}", font={FONT_MONO_BOLD}, command=root.destroy, relief='flat').pack()
-
+    else: TkButton(btn_frame, text="ACKNOWLEDGE", bg="#111111", fg="{FG_WHITE}", font={FONT_MONO_BOLD}, command=root.destroy, relief='flat').pack()
 root.after(100, force_front)
-root.mainloop()
-"""
+root.mainloop()"""
         subprocess.Popen([sys.executable, "-c", script])
 
     def poll_loop():
         first_run = True
         last_notif_id = -1
         last_disk_alert = 0
+        loop_counter = 0
         
         while True:
+            # 1. MAIN TELEMETRY CHECK-IN
             try:
                 payload = gather_telemetry()
                 headers = STD_HEADERS.copy()
@@ -911,15 +911,26 @@ root.mainloop()
                 if payload["disk_warning"] and time.time() - last_disk_alert > 86400:
                     last_disk_alert = time.time()
                     alert = {"api_key": AGENT_API_KEY, "requester_name": "SYSTEM", "asset_tag": ASSET_TAG, "category": "Hardware", "priority": "High", "subject": "AUTO-ALERT: Low Disk Space", "description": f"Main Drive is over 90% full on {ASSET_TAG}."}
-                    theaders = STD_HEADERS.copy()
-                    theaders['Content-Type'] = 'application/json'
-                    treq = urllib.request.Request(f"{SERVER_URL}/api/tickets", data=json.dumps(alert).encode('utf-8'), headers=theaders)
+                    treq = urllib.request.Request(f"{SERVER_URL}/api/tickets", data=json.dumps(alert).encode('utf-8'), headers=headers)
                     urllib.request.urlopen(treq, timeout=5)
 
                 if resp_data.get("update_url"): trigger_self_update(resp_data["update_url"])
-            except Exception as e: 
-                logging.warning(f"Poll checkin failed: {e}")
+            except Exception as e: logging.warning(f"Poll checkin failed: {e}")
 
+            # 2. FEATURE 5: ROGUE PROCESS WATCHDOG (Runs every 5 loops / 5 minutes)
+            if loop_counter % 5 == 0:
+                try:
+                    critical = ["AnyDesk.exe"] if SYS_OS == "Windows" else ["AnyDesk"]
+                    running = [p.info['name'] for p in psutil.process_iter(['name'])]
+                    for proc in critical:
+                        if proc not in running and AGENT_CACHE.get('anydesk') != "NOT INSTALLED" and not first_run:
+                            w_alert = {"api_key": AGENT_API_KEY, "requester_name": "WATCHDOG", "asset_tag": ASSET_TAG, "category": "Security", "priority": "High", "subject": f"WATCHDOG ALERT: {proc} Terminated", "description": f"Critical security process {proc} was terminated on {ASSET_TAG}."}
+                            theaders = STD_HEADERS.copy()
+                            theaders['Content-Type'] = 'application/json'
+                            urllib.request.urlopen(urllib.request.Request(f"{SERVER_URL}/api/tickets", data=json.dumps(w_alert).encode('utf-8'), headers=theaders), timeout=5)
+                except Exception as e: logging.warning(f"Watchdog scan failed: {e}")
+
+            # 3. NOTIFICATIONS FETCH
             try:
                 headers = STD_HEADERS.copy()
                 headers['Authorization'] = f'Bearer {AGENT_API_KEY}'
@@ -933,12 +944,12 @@ root.mainloop()
                             show_notification(n['message'], n['priority'], n['company_name'])
             except Exception: pass
 
+            # 4. REMOTE ACTIONS EXECUTION
             try:
                 headers = STD_HEADERS.copy()
                 headers['Authorization'] = f'Bearer {AGENT_API_KEY}'
                 req = urllib.request.Request(f"{SERVER_URL}/api/actions?tag={ASSET_TAG}", headers=headers)
-                resp = urllib.request.urlopen(req, timeout=5)
-                actions_list = json.loads(resp.read().decode('utf-8'))
+                actions_list = json.loads(urllib.request.urlopen(req, timeout=5).read().decode('utf-8'))
                 for a in actions_list:
                     action_type = a.get('action_type')
                     cmd = a.get('payload', '') if action_type == 'CUSTOM_SCRIPT' else SAFE_ACTIONS.get(SYS_OS, {}).get(action_type)
@@ -949,9 +960,8 @@ root.mainloop()
                                 si = subprocess.STARTUPINFO()
                                 si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                                 process = subprocess.run(f'powershell.exe -Command "{cmd}"', shell=True, capture_output=True, text=True, startupinfo=si, timeout=300)
-                            else:
-                                process = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
-                            output = (process.stdout + "\n" + process.stderr).strip() or "Command completed successfully with no console output."
+                            else: process = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
+                            output = (process.stdout + "\n" + process.stderr).strip() or "Command completed successfully."
                         except subprocess.TimeoutExpired: output = "Error: Command timed out after 5 minutes."
                         except Exception as e: output = f"Execution Error: {str(e)}"
                             
@@ -962,17 +972,18 @@ root.mainloop()
             except Exception: pass
             
             first_run = False
+            loop_counter += 1
             time.sleep(60)
 
-    # VERY IMPORTANT: Only initialize cache in the daemon thread to avoid blocking UI popups!
     threading.Thread(target=initialize_cache, daemon=True).start()
-    
-    ensure_startup()
+    threading.Thread(target=idle_tracker, daemon=True).start()
     threading.Thread(target=poll_loop, daemon=True).start()
+    ensure_startup()
     
     if SYS_OS == "Windows":
         menu = pystray.Menu(
             item('System Monitor', lambda: spawn_ui('--ui-info')),
+            item('Software Center', lambda: spawn_ui('--ui-store')),
             item('Submit IT Ticket', lambda: spawn_ui('--ui-ticket')),
             pystray.Menu.SEPARATOR,
             item('Admin Dashboard', lambda: spawn_ui('--ui-admin')),
@@ -982,24 +993,19 @@ root.mainloop()
         icon.run()
     else:
         import rumps
-        def _launch_info(sender): spawn_ui('--ui-info')
-        def _launch_ticket(sender): spawn_ui('--ui-ticket')
-        def _launch_admin(sender): spawn_ui('--ui-admin')
-        
         app = rumps.App("OmniDeploy", title="🚀")
         app.menu = [
-            rumps.MenuItem("System Monitor", callback=_launch_info),
-            rumps.MenuItem("Submit IT Ticket", callback=_launch_ticket),
+            rumps.MenuItem("System Monitor", callback=lambda _: spawn_ui('--ui-info')),
+            rumps.MenuItem("Software Center", callback=lambda _: spawn_ui('--ui-store')),
+            rumps.MenuItem("Submit IT Ticket", callback=lambda _: spawn_ui('--ui-ticket')),
             None,
-            rumps.MenuItem("Admin Dashboard", callback=_launch_admin)
+            rumps.MenuItem("Admin Dashboard", callback=lambda _: spawn_ui('--ui-admin'))
         ]
         app.run()
 
-# ==========================================
-# LAUNCH ROUTER
-# ==========================================
 if __name__ == "__main__":
     if "--ui-info" in sys.argv: run_info_ui()
     elif "--ui-ticket" in sys.argv: run_ticket_ui()
     elif "--ui-admin" in sys.argv: run_admin_auth_ui()
+    elif "--ui-store" in sys.argv: run_store_ui()
     else: agent_daemon()

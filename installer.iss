@@ -1,6 +1,6 @@
 ; OMNIDEPLOY IT - INNO SETUP CONFIGURATION
 #define MyAppName "OmniDeploy IT Agent"
-#define MyAppVersion "2.1.0"
+#define MyAppVersion "3.0.0"
 #define MyAppPublisher "Techtix"
 #define MyAppExeName "OmniDeploy ITAgent.exe"
 
@@ -15,7 +15,7 @@ AllowNoIcons=yes
 ; Require Admin for Program Files access
 PrivilegesRequired=admin
 OutputDir=.\installer_output
-OutputBaseFilename=OmniDeployIT_Setup_v2.1.0
+OutputBaseFilename=OmniDeployIT_Setup_v3.0.0
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
