@@ -307,15 +307,37 @@ def gather_telemetry():
         "disk_warning": disk_warning, "active_minutes": ACTIVE_MINUTES_TODAY, "uptime_days": uptime_days
     }
 
+# ==========================================
+# UI SPWNER & DOCK FIX
+# ==========================================
 def spawn_ui(flag):
     logging.info(f"Spawning UI Window with flag: {flag}")
+    
+    # 1. Clean the environment so the child PyInstaller doesn't trip over the parent's temp folders
+    clean_env = os.environ.copy()
+    clean_env.pop('_MEIPASS2', None)
+    clean_env.pop('_MEIPASS', None)
+    clean_env.pop('PYTHONHOME', None)
+    clean_env.pop('PYTHONPATH', None)
+    
     if getattr(sys, 'frozen', False):
         exe_path = os.path.abspath(sys.executable)
         if SYS_OS == "Darwin" and ".app/Contents/MacOS" in exe_path:
             app_path = exe_path.split(".app/Contents/MacOS")[0] + ".app"
-            subprocess.Popen(["open", "-n", "-a", app_path, "--args", flag])
-        else: subprocess.Popen([exe_path, flag])
-    else: subprocess.Popen([sys.executable, sys.argv[0], flag])
+            subprocess.Popen(["open", "-n", "-a", app_path, "--args", flag], env=clean_env)
+        else: 
+            # 2. DEVNULL and CREATE_NO_WINDOW fix the embedded Python crash in --windowed mode
+            c_flags = 0x08000000 if SYS_OS == "Windows" else 0
+            subprocess.Popen(
+                [exe_path, flag], 
+                env=clean_env, 
+                stdin=subprocess.DEVNULL, 
+                stdout=subprocess.DEVNULL, 
+                stderr=subprocess.DEVNULL,
+                creationflags=c_flags
+            )
+    else: 
+        subprocess.Popen([sys.executable, sys.argv[0], flag], env=clean_env)
 
 def show_dock_icon():
     if SYS_OS == "Darwin":
