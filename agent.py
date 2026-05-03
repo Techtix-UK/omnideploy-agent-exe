@@ -42,10 +42,9 @@ else:
 from PIL import Image, ImageDraw, ImageGrab
 
 # --- CONFIGURATION ---
-AGENT_VERSION = "4.0.3"
+AGENT_VERSION = "4.2.0"
 ADMIN_PASSWORD = "1886wysiwyG"     
 
-# --- ANTI-CLOUDFLARE HEADERS ---
 STD_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept': 'application/json, text/html, */*'
@@ -73,9 +72,6 @@ FONT_TITLE = ("Helvetica Neue", 18, "bold")
 FONT_SUB = ("Helvetica Neue", 11)
 FONT_CARD_TITLE = ("Helvetica Neue", 12, "bold")
 
-# ==========================================
-# UNIFIED PERSISTENT CONFIGURATION & LOGGING
-# ==========================================
 if SYS_OS == "Darwin":
     AGENT_CONFIG_DIR = os.path.join(os.path.expanduser('~'), "Library", "Application Support", "Techtix", "OmniDeployAgent")
 else:
@@ -84,8 +80,27 @@ else:
 os.makedirs(AGENT_CONFIG_DIR, exist_ok=True)
 CONFIG_FILE = os.path.join(AGENT_CONFIG_DIR, "agent_config.json")
 LOG_FILE = os.path.join(AGENT_CONFIG_DIR, "omnideploy-logs.txt")
+OFFLINE_QUEUE_FILE = os.path.join(AGENT_CONFIG_DIR, "offline_tickets.json")
 
 logging.basicConfig(filename=LOG_FILE, level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f: return json.load(f)
+        except: pass
+    return {}
+
+def save_config(data):
+    cfg = load_config()
+    cfg.update(data)
+    with open(CONFIG_FILE, 'w') as f: json.dump(cfg, f)
+
+_cfg = load_config()
+if _cfg.get("branding"):
+    BG_MAIN = _cfg["branding"].get("main", BG_MAIN)
+    BG_BTN = _cfg["branding"].get("accent", BG_BTN)
+    FG_CYAN = BG_BTN
 
 def upload_logs_to_server():
     try:
@@ -110,18 +125,6 @@ def global_exception_handler(exc_type, exc_value, exc_traceback):
 
 sys.excepthook = global_exception_handler
 logging.info(f"=== OmniDeploy Agent v{AGENT_VERSION} Booting ===")
-
-def load_config():
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, 'r') as f: return json.load(f)
-        except: pass
-    return {}
-
-def save_config(data):
-    cfg = load_config()
-    cfg.update(data)
-    with open(CONFIG_FILE, 'w') as f: json.dump(cfg, f)
 
 def init_agent_identity():
     cfg = load_config()
@@ -256,7 +259,8 @@ def gather_telemetry():
         initialize_cache()
 
     boot_time = datetime.fromtimestamp(psutil.boot_time())
-    uptime = f"{(datetime.now() - boot_time).days} Days"
+    uptime_days = (datetime.now() - boot_time).days
+    uptime = f"{uptime_days} Days"
     try: current_user = psutil.users()[0].name if psutil.users() else "UNKNOWN"
     except Exception: current_user = "SYSTEM"
     try: 
@@ -273,14 +277,11 @@ def gather_telemetry():
         for p in psutil.disk_partitions():
             if 'cdrom' not in p.opts and p.fstype != '':
                 usage = psutil.disk_usage(p.mountpoint)
-                
-                # --- FEATURE 1: AUTO-REMEDIATION (SELF-HEALING) ---
                 if (p.device.startswith("C:") or p.device == "/") and usage.percent > 90:
                     logging.warning("Drive > 90%. Initiating Auto-Remediation...")
                     if SYS_OS == "Windows": execute_cmd(r"powershell.exe -Command Clear-RecycleBin -Force -ErrorAction SilentlyContinue; Remove-Item -Path $env:TEMP\* -Recurse -Force -ErrorAction SilentlyContinue")
                     elif SYS_OS == "Darwin": execute_cmd("rm -rf ~/.Trash/*; rm -rf ~/Library/Caches/*")
                     
-                    # Recheck after healing attempt
                     usage = psutil.disk_usage(p.mountpoint)
                     if usage.percent > 90: disk_warning = True
 
@@ -303,12 +304,9 @@ def gather_telemetry():
         "bitlocker": bitlocker or "UNVERIFIED", "domain_location": AGENT_CACHE.get('domain_location', 'Unknown'), 
         "purchase_date": AGENT_CACHE.get('purchase_date', 'Unknown'), "software_installed": AGENT_CACHE.get('software', 'Unknown'), 
         "agent_version": AGENT_VERSION, "anydesk_id": AGENT_CACHE.get('anydesk', 'Unknown'), "battery": battery, 
-        "disk_warning": disk_warning, "active_minutes": ACTIVE_MINUTES_TODAY
+        "disk_warning": disk_warning, "active_minutes": ACTIVE_MINUTES_TODAY, "uptime_days": uptime_days
     }
 
-# ==========================================
-# UI SPWNER & DOCK FIX
-# ==========================================
 def spawn_ui(flag):
     logging.info(f"Spawning UI Window with flag: {flag}")
     if getattr(sys, 'frozen', False):
@@ -328,9 +326,6 @@ def show_dock_icon():
             app.activateIgnoringOtherApps_(True)
         except Exception: pass
 
-# ==========================================
-# MODERN SYSTEM DASHBOARD
-# ==========================================
 def draw_arc_meter(canvas, x, y, radius, percentage, color, title, value_text):
     canvas.create_arc(x-radius, y-radius, x+radius, y+radius, start=180, extent=-180, style=tk.ARC, outline="#475569", width=10)
     extent = -180 * (percentage / 100)
@@ -338,6 +333,87 @@ def draw_arc_meter(canvas, x, y, radius, percentage, color, title, value_text):
     canvas.create_text(x, y-radius-18, text=title, fill=FG_WHITE, font=("Helvetica Neue", 10))
     canvas.create_text(x, y-10, text=value_text, fill=FG_WHITE, font=("Helvetica Neue", 12, "bold"))
 
+# ==========================================
+# FEATURE: IT RED BUTTON (NEW UI)
+# ==========================================
+def run_red_button_ui():
+    root = tk.Tk()
+    root.report_callback_exception = global_exception_handler
+    show_dock_icon()
+    root.title("IT Support - Device Info")
+    root.configure(bg=BG_MAIN)
+    root.resizable(False, False)
+    
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    root.geometry(f"550x550+{(sw-550)//2}+{(sh-550)//2}")
+    
+    # Header
+    tk.Label(root, text="YOUR ASSET NUMBER", fg=FG_MUTED, bg=BG_MAIN, font=("Helvetica Neue", 12, "bold")).pack(pady=(20, 0))
+    tk.Label(root, text=ASSET_TAG, fg=FG_DANGER, bg=BG_MAIN, font=("Helvetica Neue", 48, "bold")).pack()
+    tk.Label(root, text="Please provide this number when contacting IT.", fg=FG_WHITE, bg=BG_MAIN, font=("Helvetica Neue", 10, "italic")).pack(pady=(0, 20))
+
+    # Info Grid Frame
+    info_frame = tk.Frame(root, bg=BG_CARD, highlightbackground="#334155", highlightthickness=1, padx=20, pady=15)
+    info_frame.pack(fill='x', padx=30, pady=10)
+
+    ui_queue = queue.Queue()
+    def process_queue():
+        try:
+            while True: ui_queue.get_nowait()()
+        except queue.Empty: pass
+        root.after(100, process_queue)
+    process_queue()
+
+    # Placeholders for data
+    labels = {}
+    row_idx = 0
+    for key, disp in [("current_user", "Logged In User:"), ("ip_address", "Local IP Address:"), ("mac_address", "MAC Address:"), ("os", "Operating System:"), ("uptime", "System Uptime:"), ("anydesk_id", "AnyDesk ID:")]:
+        tk.Label(info_frame, text=disp, fg=FG_MUTED, bg=BG_CARD, font=("Helvetica Neue", 11, "bold")).grid(row=row_idx, column=0, sticky='w', pady=4)
+        labels[key] = tk.Label(info_frame, text="Loading...", fg=FG_WHITE, bg=BG_CARD, font=("Helvetica Neue", 11))
+        labels[key].grid(row=row_idx, column=1, sticky='w', padx=10, pady=4)
+        row_idx += 1
+
+    # Load data async so UI appears instantly
+    def load_data():
+        tel = gather_telemetry()
+        for k, lbl in labels.items():
+            ui_queue.put(lambda k=k, lbl=lbl: lbl.config(text=tel.get(k, "N/A")))
+    threading.Thread(target=load_data, daemon=True).start()
+
+    # Action Buttons
+    btn_frame = tk.Frame(root, bg=BG_MAIN)
+    btn_frame.pack(pady=25, fill='x', padx=30)
+    
+    # Split into a 2x2 grid of big buttons
+    btn_frame.columnconfigure(0, weight=1)
+    btn_frame.columnconfigure(1, weight=1)
+
+    TkButton(btn_frame, text="Raise IT Ticket", bg=BG_BTN, fg=FG_WHITE, font=FONT_MONO_BOLD, command=lambda: [root.destroy(), spawn_ui('--ui-ticket')]).grid(row=0, column=0, sticky='ew', padx=5, pady=5, ipady=8)
+    TkButton(btn_frame, text="Software Center", bg=BG_GREEN, fg="#000", font=FONT_MONO_BOLD, command=lambda: [root.destroy(), spawn_ui('--ui-store')]).grid(row=0, column=1, sticky='ew', padx=5, pady=5, ipady=8)
+    
+    def run_magic_wand():
+        wand_btn.config(text="Fixing...", state="disabled")
+        root.update()
+        if SYS_OS == "Windows":
+            execute_cmd(SAFE_ACTIONS["Windows"]["FLUSH_DNS"])
+            execute_cmd(SAFE_ACTIONS["Windows"]["CLEAR_TEMP"])
+            execute_cmd(SAFE_ACTIONS["Windows"]["RESTART_SPOOLER"])
+        elif SYS_OS == "Darwin":
+            execute_cmd(SAFE_ACTIONS["Darwin"]["FLUSH_DNS"])
+            execute_cmd(SAFE_ACTIONS["Darwin"]["CLEAR_TEMP"])
+        messagebox.showinfo("PC Optimized", "We've flushed your DNS cache, restarted the print spooler, and cleared temporary files.\n\nYour PC should be running smoothly now!", parent=root)
+        wand_btn.config(text="🔧 Quick Fix / Optimize", state="normal")
+
+    wand_btn = TkButton(btn_frame, text="🔧 Quick Fix / Optimize", bg=BG_BTN_DARK, fg=FG_WHITE, font=FONT_MONO_BOLD, command=run_magic_wand)
+    wand_btn.grid(row=1, column=0, sticky='ew', padx=5, pady=5, ipady=8)
+    TkButton(btn_frame, text="🚨 Urgent Callback", bg=BG_BTN_DANGER, fg=FG_WHITE, font=FONT_MONO_BOLD, command=lambda: [root.destroy(), spawn_ui('--ui-panic')]).grid(row=1, column=1, sticky='ew', padx=5, pady=5, ipady=8)
+
+    if SYS_OS == "Darwin": os.system(f'''/usr/bin/osascript -e 'tell application "System Events" to set frontmost of every process whose unix id is {os.getpid()} to true' ''')
+    root.mainloop()
+
+# ==========================================
+# EXISTING UIs
+# ==========================================
 def run_info_ui():
     root = tk.Tk()
     root.report_callback_exception = global_exception_handler
@@ -434,6 +510,23 @@ def run_info_ui():
 
     footer = tk.Frame(root, bg=BG_MAIN, pady=10, padx=20)
     footer.pack(side='bottom', fill='x')
+
+    def run_magic_wand():
+        btn_fix.config(text="Fixing...", state="disabled")
+        root.update()
+        if SYS_OS == "Windows":
+            execute_cmd(SAFE_ACTIONS["Windows"]["FLUSH_DNS"])
+            execute_cmd(SAFE_ACTIONS["Windows"]["CLEAR_TEMP"])
+            execute_cmd(SAFE_ACTIONS["Windows"]["RESTART_SPOOLER"])
+        elif SYS_OS == "Darwin":
+            execute_cmd(SAFE_ACTIONS["Darwin"]["FLUSH_DNS"])
+            execute_cmd(SAFE_ACTIONS["Darwin"]["CLEAR_TEMP"])
+        messagebox.showinfo("PC Optimized", "We've flushed your DNS cache, restarted the print spooler, and cleared temporary files.\n\nYour PC should be running smoothly now!", parent=root)
+        btn_fix.config(text="🔧 Quick Fix / Optimize", state="normal")
+
+    btn_fix = TkButton(footer, text="🔧 Quick Fix / Optimize", bg=BG_BTN_DARK, fg=FG_WHITE, font=("Helvetica Neue", 10, "bold"), relief='flat', command=run_magic_wand)
+    btn_fix.pack(side='left', padx=5, ipadx=10, ipady=4)
+
     TkButton(footer, text="Report Issue", bg=BG_BTN_DANGER, fg=FG_WHITE, font=("Helvetica Neue", 10, "bold"), relief='flat', command=lambda: [root.destroy(), spawn_ui('--ui-ticket')]).pack(side='right', padx=5, ipadx=10, ipady=4)
 
     def fetch_async():
@@ -468,9 +561,6 @@ def run_info_ui():
     if SYS_OS == "Darwin": os.system(f'''/usr/bin/osascript -e 'tell application "System Events" to set frontmost of every process whose unix id is {os.getpid()} to true' ''')
     root.mainloop()
 
-# ==========================================
-# SOFTWARE CENTER (APP STORE)
-# ==========================================
 def run_store_ui():
     root = tk.Tk()
     root.report_callback_exception = global_exception_handler
@@ -496,9 +586,7 @@ def run_store_ui():
     listbox.pack(fill='both', expand=True, padx=20, pady=10)
 
     catalog = []
-    
-    def _log(msg):
-        ui_queue.put(lambda: lbl_status.config(text=msg))
+    def _log(msg): ui_queue.put(lambda: lbl_status.config(text=msg))
 
     lbl_status = tk.Label(root, text="Loading Approved Software...", fg=FG_WHITE, bg=BG_MAIN, font=FONT_MONO)
     lbl_status.pack(pady=5)
@@ -522,7 +610,6 @@ def run_store_ui():
         sel = listbox.curselection()
         if not sel: return
         pkg = catalog[sel[0]]
-        
         def _deploy():
             _log(f"Downloading {pkg['name']}...")
             url_lower = pkg['url'].lower()
@@ -532,8 +619,7 @@ def run_store_ui():
                 req = urllib.request.Request(pkg['url'], headers=STD_HEADERS)
                 with urllib.request.urlopen(req) as response, open(dp, 'wb') as out_file: out_file.write(response.read())
             except Exception as e:
-                _log(f"Download failed: {e}")
-                return
+                _log(f"Download failed: {e}"); return
                 
             _log(f"Installing {pkg['name']} silently in background...")
             try:
@@ -557,7 +643,6 @@ def run_store_ui():
                 if os.path.exists(dp):
                     try: os.remove(dp)
                     except: pass
-
         threading.Thread(target=_deploy, daemon=True).start()
 
     btn_frame = tk.Frame(root, bg=BG_MAIN)
@@ -568,9 +653,40 @@ def run_store_ui():
     if SYS_OS == "Darwin": os.system(f'''/usr/bin/osascript -e 'tell application "System Events" to set frontmost of every process whose unix id is {os.getpid()} to true' ''')
     root.mainloop()
 
-# ==========================================
-# TICKET UI (WITH NATIVE SCREENSHOT & DIAG)
-# ==========================================
+def run_panic_ui():
+    root = tk.Tk()
+    root.withdraw()
+    show_dock_icon()
+    root.attributes('-topmost', True)
+    
+    phone = simpledialog.askstring("Emergency Support Required", "Please enter your phone number. An IT agent will call you immediately.", parent=root)
+    if phone:
+        try: req_name = psutil.users()[0].name if psutil.users() else "User"
+        except: req_name = "User"
+        
+        payload = {
+            "api_key": AGENT_API_KEY, "requester_name": req_name, "asset_tag": ASSET_TAG, 
+            "category": "Self-Service", "priority": "EMERGENCY", "subject": "URGENT CALL REQUEST", 
+            "description": f"User pressed the Panic Button and requested an immediate callback at: {phone}"
+        }
+        
+        try:
+            headers = STD_HEADERS.copy()
+            headers['Content-Type'] = 'application/json'
+            req = urllib.request.Request(f"{SERVER_URL}/api/tickets", data=json.dumps(payload).encode('utf-8'), headers=headers)
+            urllib.request.urlopen(req, timeout=10)
+            messagebox.showinfo("Emergency Alert Sent", f"IT has been notified. They will call {phone} shortly.", parent=root)
+        except Exception as e:
+            try:
+                queue = []
+                if os.path.exists(OFFLINE_QUEUE_FILE):
+                    with open(OFFLINE_QUEUE_FILE, 'r') as f: queue = json.load(f)
+                queue.append(payload)
+                with open(OFFLINE_QUEUE_FILE, 'w') as f: json.dump(queue, f)
+                messagebox.showwarning("Offline Mode", "We cannot reach the server right now. Your emergency request has been saved and will be sent automatically once internet is restored.", parent=root)
+            except: pass
+    root.destroy()
+
 def run_ticket_ui():
     logging.info("Building Ticket UI...")
     root = tk.Tk()
@@ -617,24 +733,17 @@ def run_ticket_ui():
             "category": "Self-Service", "priority": "Normal", "subject": subject_text, "description": desc_text
         }
 
-        # --- NATIVE SCREENSHOT CAPTURE ---
         try:
             ss_path = os.path.join(os.environ.get('TEMP', '/tmp'), "ticket_ss.jpg")
-            if SYS_OS == "Darwin":
-                # Uses Apple's native tool for perfect Retina support and reliable permissions
-                subprocess.run(["screencapture", "-x", "-t", "jpg", ss_path], check=True)
+            if SYS_OS == "Darwin": subprocess.run(["screencapture", "-x", "-t", "jpg", ss_path], check=True)
             else:
                 ss = ImageGrab.grab()
                 ss.convert("RGB").save(ss_path, format="JPEG", quality=70) 
             
             if os.path.exists(ss_path):
-                with open(ss_path, "rb") as f:
-                    b64_img = base64.b64encode(f.read()).decode('utf-8')
-                
-                # Send the screenshot securely inside the main ticket payload
+                with open(ss_path, "rb") as f: b64_img = base64.b64encode(f.read()).decode('utf-8')
                 payload["file_name"] = f"SCREENSHOT_{datetime.now().strftime('%H%M%S')}.jpg"
                 payload["file_data"] = b64_img
-                
                 try: os.remove(ss_path)
                 except: pass
         except Exception as e: logging.error(f"Auto-Screenshot failed: {e}")
@@ -643,18 +752,28 @@ def run_ticket_ui():
             headers = STD_HEADERS.copy()
             headers['Content-Type'] = 'application/json'
             req = urllib.request.Request(f"{SERVER_URL}/api/tickets", data=json.dumps(payload).encode('utf-8'), headers=headers)
-            urllib.request.urlopen(req, timeout=30)
+            urllib.request.urlopen(req, timeout=20)
             messagebox.showinfo("Success", "Ticket submitted to IT.", parent=root)
             root.destroy()
-        except Exception as e: messagebox.showerror("Error", f"Failed: {e}", parent=root)
+        except Exception as e: 
+            try:
+                queue_list = []
+                if os.path.exists(OFFLINE_QUEUE_FILE):
+                    with open(OFFLINE_QUEUE_FILE, 'r') as f: queue_list = json.load(f)
+                
+                payload["description"] = f"[OFFLINE TICKET CAPTURED AT {datetime.now().strftime('%Y-%m-%d %H:%M')}]\n\n" + payload["description"]
+                queue_list.append(payload)
+                
+                with open(OFFLINE_QUEUE_FILE, 'w') as f: json.dump(queue_list, f)
+                messagebox.showwarning("Offline Mode", "It looks like you are offline or the server is unreachable.\n\nDon't worry! Your ticket and screenshot have been saved securely on this PC. They will be submitted automatically in the background as soon as you reconnect to the internet.", parent=root)
+                root.destroy()
+            except Exception as e2:
+                messagebox.showerror("Error", f"Failed: {e}\nCould not save offline: {e2}", parent=root)
             
     TkButton(root, text="SUBMIT TICKET", bg=BG_BTN, fg=FG_WHITE, font=FONT_MONO_BOLD, command=send_ticket, relief='flat').pack(pady=10)
     if SYS_OS == "Darwin": os.system(f'''/usr/bin/osascript -e 'tell application "System Events" to set frontmost of every process whose unix id is {os.getpid()} to true' ''')
     root.mainloop()
 
-# ==========================================
-# ADMIN AUTH & DASHBOARD
-# ==========================================
 def run_admin_auth_ui():
     root = tk.Tk()
     root.report_callback_exception = global_exception_handler
@@ -803,11 +922,7 @@ def run_admin_dashboard():
     console.pack(fill='both', expand=True, padx=20, pady=(0,20))
     root.mainloop()
 
-# ==========================================
-# FEATURE 2: DEPLOYMENT DEFERRAL UI
-# ==========================================
 def run_deferral_ui(app_name):
-    """Provides a Snooze UI for mandatory deployments triggered remotely."""
     root = tk.Tk()
     show_dock_icon()
     root.title("IT Update Required")
@@ -821,7 +936,7 @@ def run_deferral_ui(app_name):
     tk.Label(root, text=f"Your IT department requires {app_name} to be installed.", fg=FG_WHITE, bg=BG_MAIN, font=FONT_SUB).pack()
     
     def select_action(choice):
-        print(choice)  # Pipe stdout back to the background daemon
+        print(choice)
         root.destroy()
         
     btn_frame = tk.Frame(root, bg=BG_MAIN)
@@ -832,86 +947,8 @@ def run_deferral_ui(app_name):
     if SYS_OS == "Darwin": os.system(f'''/usr/bin/osascript -e 'tell application "System Events" to set frontmost of every process whose unix id is {os.getpid()} to true' ''')
     root.mainloop()
 
-# ==========================================
-# BACKGROUND DAEMON & WATCHDOGS
-# ==========================================
-def idle_tracker():
-    global ACTIVE_MINUTES_TODAY
-    while True:
-        time.sleep(60)
-        idle_sec = 0
-        try:
-            if SYS_OS == "Windows":
-                import ctypes
-                class LASTINPUTINFO(ctypes.Structure):
-                    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_ulong)]
-                lii = LASTINPUTINFO()
-                lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
-                ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii))
-                idle_sec = (ctypes.windll.kernel32.GetTickCount() - lii.dwTime) / 1000.0
-            elif SYS_OS == "Darwin":
-                out = subprocess.check_output("ioreg -c IOHIDSystem | awk '/HIDIdleTime/ {print $NF/1000000000; exit}'", shell=True)
-                idle_sec = float(out.strip())
-        except: pass
-        if idle_sec < 300: ACTIVE_MINUTES_TODAY += 1 
-
-def agent_daemon():
-    logging.info("Starting Background Daemon loop...")
-    def create_image():
-        image = Image.new('RGB', (64, 64), color=(0, 68, 204))
-        ImageDraw.Draw(image).ellipse((16, 16, 48, 48), fill=(0, 213, 255))
-        return image
-        
-    def ensure_startup():
-        if getattr(sys, 'frozen', False):
-            exe_path = os.path.realpath(sys.executable)
-            if SYS_OS == "Windows":
-                try:
-                    key = reg.OpenKey(reg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, reg.KEY_SET_VALUE)
-                    reg.SetValueEx(key, "OmniDeployAgent", 0, reg.REG_SZ, f'"{exe_path}"')
-                    reg.CloseKey(key)
-                except: pass
-            elif SYS_OS == "Darwin":
-                try:
-                    plist_dir = os.path.expanduser("~/Library/LaunchAgents")
-                    os.makedirs(plist_dir, exist_ok=True)
-                    plist_path = os.path.join(plist_dir, "com.omnideploy.agent.plist")
-                    plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict><key>Label</key><string>com.omnideploy.agent</string><key>ProgramArguments</key><array><string>{exe_path}</string></array><key>RunAtLoad</key><true/></dict></plist>"""
-                    with open(plist_path, 'w') as f: f.write(plist_content)
-                except: pass
-                
-    def trigger_self_update(url):
-        if not getattr(sys, 'frozen', False): return
-        logging.info("Initiating Self Update...")
-        try:
-            temp_exe = os.path.join(os.environ.get('TEMP', '/tmp'), "OmniDeployAgent_Update_Temp")
-            req = urllib.request.Request(url, headers=STD_HEADERS)
-            with urllib.request.urlopen(req) as response, open(temp_exe, 'wb') as out_file: out_file.write(response.read())
-            current_exe = os.path.realpath(sys.executable)
-            exe_name = os.path.basename(current_exe)
-            if SYS_OS == "Windows":
-                bat_path = os.path.join(os.environ['TEMP'], "update_agent.bat")
-                bat_content = f"""@echo off\nset _MEIPASS2=\nset _MEIPASS=\ntimeout /t 3 /nobreak\ntaskkill /f /im "{exe_name}"\nmove /y "{temp_exe}" "{current_exe}"\nstart "" "{current_exe}"\ndel "%~f0"\n"""
-                with open(bat_path, "w") as f: f.write(bat_content)
-                si = subprocess.STARTUPINFO()
-                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                clean_env = os.environ.copy()
-                clean_env.pop('_MEIPASS2', None)
-                clean_env.pop('_MEIPASS', None)
-                subprocess.Popen(["cmd.exe", "/c", bat_path], startupinfo=si, env=clean_env, creationflags=0x08000000)
-            elif SYS_OS == "Darwin":
-                sh_path = os.path.join('/tmp', "update_agent.sh")
-                sh_content = f"""#!/bin/bash\nsleep 3\nkillall "{exe_name}"\nmv -f "{temp_exe}" "{current_exe}"\nchmod +x "{current_exe}"\nopen "{current_exe}"\nrm "$0"\n"""
-                with open(sh_path, "w") as f: f.write(sh_content)
-                os.chmod(sh_path, 0o755)
-                subprocess.Popen(["/bin/bash", sh_path], start_new_session=True)
-            os._exit(0)
-        except Exception as e: logging.error(f"Self-Update failed: {e}")
-
-    def show_notification(message, priority, comp_name):
-        script = f"""
+def show_notification(message, priority, comp_name):
+    script = f"""
 import tkinter as tk
 import platform, os, subprocess
 SYS_OS = platform.system()
@@ -948,7 +985,45 @@ else:
     else: TkButton(btn_frame, text="ACKNOWLEDGE", bg="#111111", fg="{FG_WHITE}", font={FONT_MONO_BOLD}, command=root.destroy, relief='flat').pack()
 root.after(100, force_front)
 root.mainloop()"""
-        subprocess.Popen([sys.executable, "-c", script])
+    subprocess.Popen([sys.executable, "-c", script])
+
+# ==========================================
+# BACKGROUND DAEMON & WATCHDOGS
+# ==========================================
+def agent_daemon():
+    logging.info("Starting Background Daemon loop...")
+    def create_image():
+        image = Image.new('RGB', (64, 64), color=(0, 68, 204))
+        ImageDraw.Draw(image).ellipse((16, 16, 48, 48), fill=(0, 213, 255))
+        return image
+                
+    def trigger_self_update(url):
+        if not getattr(sys, 'frozen', False): return
+        logging.info("Initiating Self Update...")
+        try:
+            temp_exe = os.path.join(os.environ.get('TEMP', '/tmp'), "OmniDeployAgent_Update_Temp")
+            req = urllib.request.Request(url, headers=STD_HEADERS)
+            with urllib.request.urlopen(req) as response, open(temp_exe, 'wb') as out_file: out_file.write(response.read())
+            current_exe = os.path.realpath(sys.executable)
+            exe_name = os.path.basename(current_exe)
+            if SYS_OS == "Windows":
+                bat_path = os.path.join(os.environ['TEMP'], "update_agent.bat")
+                bat_content = f"""@echo off\nset _MEIPASS2=\nset _MEIPASS=\ntimeout /t 3 /nobreak\ntaskkill /f /im "{exe_name}"\nmove /y "{temp_exe}" "{current_exe}"\nstart "" "{current_exe}"\ndel "%~f0"\n"""
+                with open(bat_path, "w") as f: f.write(bat_content)
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                clean_env = os.environ.copy()
+                clean_env.pop('_MEIPASS2', None)
+                clean_env.pop('_MEIPASS', None)
+                subprocess.Popen(["cmd.exe", "/c", bat_path], startupinfo=si, env=clean_env, creationflags=0x08000000)
+            elif SYS_OS == "Darwin":
+                sh_path = os.path.join('/tmp', "update_agent.sh")
+                sh_content = f"""#!/bin/bash\nsleep 3\nkillall "{exe_name}"\nmv -f "{temp_exe}" "{current_exe}"\nchmod +x "{current_exe}"\nopen "{current_exe}"\nrm "$0"\n"""
+                with open(sh_path, "w") as f: f.write(sh_content)
+                os.chmod(sh_path, 0o755)
+                subprocess.Popen(["/bin/bash", sh_path], start_new_session=True)
+            os._exit(0)
+        except Exception as e: logging.error(f"Self-Update failed: {e}")
 
     def poll_loop():
         global PREV_DISKS
@@ -959,7 +1034,27 @@ root.mainloop()"""
         
         while True:
 
-            # --- DLP (USB MONITOR) ---
+            if os.path.exists(OFFLINE_QUEUE_FILE):
+                try:
+                    with open(OFFLINE_QUEUE_FILE, 'r') as f:
+                        offline_tickets = json.load(f)
+                    
+                    if offline_tickets:
+                        remaining_queue = []
+                        headers = STD_HEADERS.copy()
+                        headers['Content-Type'] = 'application/json'
+                        
+                        for ticket_payload in offline_tickets:
+                            try:
+                                req = urllib.request.Request(f"{SERVER_URL}/api/tickets", data=json.dumps(ticket_payload).encode('utf-8'), headers=headers)
+                                urllib.request.urlopen(req, timeout=10)
+                                logging.info("Successfully uploaded offline ticket.")
+                            except Exception:
+                                remaining_queue.append(ticket_payload)
+                        
+                        with open(OFFLINE_QUEUE_FILE, 'w') as f: json.dump(remaining_queue, f)
+                except Exception as e: logging.error(f"Offline queue processing failed: {e}")
+
             try:
                 current_disks = set(p.device for p in psutil.disk_partitions() if 'cdrom' not in p.opts)
                 if PREV_DISKS:
@@ -978,6 +1073,16 @@ root.mainloop()"""
                 req = urllib.request.Request(f"{SERVER_URL}/api/checkin", data=json.dumps(payload).encode('utf-8'), headers=headers)
                 resp_data = json.loads(urllib.request.urlopen(req, timeout=10).read().decode())
 
+                if resp_data.get("branding"):
+                    cfg = load_config()
+                    cfg["branding"] = resp_data["branding"]
+                    cfg["blocklist"] = resp_data.get("blocklist", "")
+                    save_config(cfg)
+
+                uptime_days = payload.get("uptime_days", 0)
+                if uptime_days >= 14 and loop_counter % 1440 == 0: 
+                    show_notification("Your PC has not been restarted in over 14 days. Please restart to install critical updates and optimize performance.", "RESTART", "IT Department")
+
                 if payload["disk_warning"] and time.time() - last_disk_alert > 86400:
                     last_disk_alert = time.time()
                     alert = {"api_key": AGENT_API_KEY, "requester_name": "SYSTEM", "asset_tag": ASSET_TAG, "category": "Hardware", "priority": "High", "subject": "AUTO-ALERT: Low Disk Space", "description": f"Main Drive is over 90% full on {ASSET_TAG} after Auto-Remediation failed."}
@@ -989,10 +1094,26 @@ root.mainloop()"""
 
             if loop_counter % 5 == 0:
                 try:
+                    raw_blocklist = load_config().get("blocklist", "")
+                    blocklist = [x.strip().lower() for x in raw_blocklist.split(',') if x.strip()]
                     critical = ["AnyDesk.exe"] if SYS_OS == "Windows" else ["AnyDesk"]
-                    running = [p.info['name'] for p in psutil.process_iter(['name'])]
+                    
+                    running_procs = []
+                    for p in psutil.process_iter(['name', 'pid']):
+                        try:
+                            p_name = p.info['name'].lower()
+                            running_procs.append(p.info['name'])
+                            
+                            if p_name in blocklist:
+                                p.kill()
+                                b_alert = {"api_key": AGENT_API_KEY, "requester_name": "WATCHDOG", "asset_tag": ASSET_TAG, "category": "Security", "priority": "High", "subject": f"BLOCKLIST ALERT: {p.info['name']}", "description": f"User attempted to launch restricted app {p.info['name']}. Process was terminated."}
+                                theaders = STD_HEADERS.copy(); theaders['Content-Type'] = 'application/json'
+                                urllib.request.urlopen(urllib.request.Request(f"{SERVER_URL}/api/tickets", data=json.dumps(b_alert).encode('utf-8'), headers=theaders), timeout=5)
+                                show_notification("This application violates IT Security Policy and has been terminated.", "HIGH", "IT Security")
+                        except: pass
+                    
                     for proc in critical:
-                        if proc not in running and AGENT_CACHE.get('anydesk') != "NOT INSTALLED" and not first_run:
+                        if proc not in running_procs and AGENT_CACHE.get('anydesk') != "NOT INSTALLED" and not first_run:
                             w_alert = {"api_key": AGENT_API_KEY, "requester_name": "WATCHDOG", "asset_tag": ASSET_TAG, "category": "Security", "priority": "High", "subject": f"WATCHDOG ALERT: {proc} Terminated", "description": f"Critical security process {proc} was terminated on {ASSET_TAG}."}
                             theaders = STD_HEADERS.copy()
                             theaders['Content-Type'] = 'application/json'
@@ -1024,15 +1145,11 @@ root.mainloop()"""
                     
                     if action_type == 'DEPLOY':
                         app_name = a.get('app_name', 'System Software')
-                        
                         exe_path = os.path.abspath(sys.executable)
                         if SYS_OS == "Darwin" and ".app/Contents/MacOS" in exe_path: app_path = exe_path.split(".app/Contents/MacOS")[0] + ".app"; ui_cmd = ["open", "-n", "-a", app_path, "--args", "--ui-defer", app_name]
                         else: ui_cmd = [exe_path, sys.argv[0] if not getattr(sys, 'frozen', False) else '', "--ui-defer", app_name]
-                        
-                        try:
-                            result = subprocess.check_output(ui_cmd, timeout=300).decode('utf-8').strip()
+                        try: result = subprocess.check_output(ui_cmd, timeout=300).decode('utf-8').strip()
                         except subprocess.TimeoutExpired: result = "SNOOZE" 
-                        
                         if "SNOOZE" in result:
                             output = "User Snoozed Deployment."
                             cmd = None
@@ -1062,16 +1179,17 @@ root.mainloop()"""
     threading.Thread(target=initialize_cache, daemon=True).start()
     threading.Thread(target=idle_tracker, daemon=True).start()
     threading.Thread(target=poll_loop, daemon=True).start()
-    ensure_startup()
     
     if SYS_OS == "Windows":
         menu = pystray.Menu(
+            item('IT Red Button (Device Info)', lambda: spawn_ui('--ui-redbutton')),
+            pystray.Menu.SEPARATOR,
             item('System Monitor', lambda: spawn_ui('--ui-info')),
             item('Software Center', lambda: spawn_ui('--ui-store')),
             item('Submit IT Ticket', lambda: spawn_ui('--ui-ticket')),
+            item('🚨 Request Urgent Call', lambda: spawn_ui('--ui-panic')), 
             pystray.Menu.SEPARATOR,
-            item('Admin Dashboard', lambda: spawn_ui('--ui-admin')),
-            item('Exit Agent', lambda icon, item: icon.stop() or os._exit(0))
+            item('Admin Dashboard', lambda: spawn_ui('--ui-admin'))
         )
         icon = pystray.Icon("OmniDeploy", create_image(), "OmniDeploy IT Agent", menu)
         icon.run()
@@ -1079,9 +1197,12 @@ root.mainloop()"""
         import rumps
         app = rumps.App("OmniDeploy", title="🚀")
         app.menu = [
+            rumps.MenuItem("IT Red Button (Device Info)", callback=lambda _: spawn_ui('--ui-redbutton')),
+            None,
             rumps.MenuItem("System Monitor", callback=lambda _: spawn_ui('--ui-info')),
             rumps.MenuItem("Software Center", callback=lambda _: spawn_ui('--ui-store')),
             rumps.MenuItem("Submit IT Ticket", callback=lambda _: spawn_ui('--ui-ticket')),
+            rumps.MenuItem("🚨 Request Urgent Call", callback=lambda _: spawn_ui('--ui-panic')),
             None,
             rumps.MenuItem("Admin Dashboard", callback=lambda _: spawn_ui('--ui-admin'))
         ]
@@ -1093,4 +1214,6 @@ if __name__ == "__main__":
     elif "--ui-admin" in sys.argv: run_admin_auth_ui()
     elif "--ui-store" in sys.argv: run_store_ui()
     elif "--ui-defer" in sys.argv: run_deferral_ui(sys.argv[-1])
+    elif "--ui-panic" in sys.argv: run_panic_ui()
+    elif "--ui-redbutton" in sys.argv: run_red_button_ui()
     else: agent_daemon()

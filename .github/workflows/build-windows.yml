@@ -36,4 +36,4 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: OmniDeploy-Windows-Installer
-        path: installer_output\OmniDeployIT_Setup_v3.0.0.exe
+        path: installer_output\OmniDeployIT_Setup_v4.2.0.exe
