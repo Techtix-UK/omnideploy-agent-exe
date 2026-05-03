@@ -990,6 +990,26 @@ root.mainloop()"""
 # ==========================================
 # BACKGROUND DAEMON & WATCHDOGS
 # ==========================================
+def idle_tracker():
+    global ACTIVE_MINUTES_TODAY
+    while True:
+        time.sleep(60)
+        idle_sec = 0
+        try:
+            if SYS_OS == "Windows":
+                import ctypes
+                class LASTINPUTINFO(ctypes.Structure):
+                    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_ulong)]
+                lii = LASTINPUTINFO()
+                lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
+                ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii))
+                idle_sec = (ctypes.windll.kernel32.GetTickCount() - lii.dwTime) / 1000.0
+            elif SYS_OS == "Darwin":
+                out = subprocess.check_output("ioreg -c IOHIDSystem | awk '/HIDIdleTime/ {print $NF/1000000000; exit}'", shell=True)
+                idle_sec = float(out.strip())
+        except: pass
+        if idle_sec < 300: ACTIVE_MINUTES_TODAY += 1
+
 def agent_daemon():
     logging.info("Starting Background Daemon loop...")
     def create_image():
